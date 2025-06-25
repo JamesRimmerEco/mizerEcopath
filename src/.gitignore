@@ -1,1 +1,6 @@
 mizerEcopath.dll
+# TMB compiled files
+src/*.o
+src/*.o.d
+src/*.dll
+src/*.so
