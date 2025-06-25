@@ -80,6 +80,7 @@ Collate:
     'tuneParams_helpers.R'
     'update_params.R'
     'getDiffusion.R'
+    'fillDefaultsFromFishBase.R'
 VignetteBuilder: quarto
 Config/testthat/edition: 3
 Language: en-GB
