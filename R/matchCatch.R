@@ -162,15 +162,19 @@ matchCatch <- function(params, species = NULL, catch, lambda = 2.05,
 
     # ── SINGLE-SIGMOID OVERRIDE ─────────────────────────────────────────────
     if (!use_double_sigmoid) {
-        initial_params$d50     <- 1e6      # park the descending limb far right
-        initial_params$r_right <- 1.0001   # >1 so the C++ maths stays finite
-    }
+        ## 1. Park the descending limb (unchanged)
+        dl_parking                <- 1e6
+        initial_params$d50        <- dl_parking
+        initial_params$r_right    <- 1.0001
 
-        lower_bounds <- sapply(default_bounds, `[`, 1)
-        upper_bounds <- sapply(default_bounds, `[`, 2)
-    if (getOption("mizerEcopath.debug.matchCatch", FALSE)) {
-        message("\nDEBUG: Optim bounds for ", species, ":\n")
-        print(data.frame(lower = lower_bounds, upper = upper_bounds))
+        ## 2. Let the ascending limb be as steep as legacy code allowed
+        default_bounds$ratio[2]   <- 0.99
+
+        ## 3.   *remove* the parked parameters from the optimisation
+        initial_params$d50        <- NULL
+        initial_params$r_right    <- NULL
+        default_bounds$d50        <- NULL
+        default_bounds$r_right    <- NULL
     }
 
     # Lock parameters where necessary
@@ -178,9 +182,6 @@ matchCatch <- function(params, species = NULL, catch, lambda = 2.05,
 
     # Lock right-hand sigmoid parameters if using single sigmoid
     if (!use_double_sigmoid) {
-        map$d50     <- factor(NA)
-        map$r_right <- factor(NA)
-
         keep <- !names(lower_bounds) %in% c("d50", "r_right")
         lower_bounds <- lower_bounds[keep]
         upper_bounds <- upper_bounds[keep]
