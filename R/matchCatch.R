@@ -183,19 +183,10 @@ matchCatch <- function(params, species = NULL, catch, lambda = 2.05,
     # Lock parameters where necessary
     map <- list()
 
-    # Lock right-hand sigmoid parameters if using single sigmoid
-    if (!use_double_sigmoid) {
-        keep <- !names(lower_bounds) %in% c("d50", "r_right")
-        lower_bounds <- lower_bounds[keep]
-        upper_bounds <- upper_bounds[keep]
-    }
-
     # Lock all selectivity parameters if no catch size data
     if (!data$use_counts) {
         map$l50         <- factor(NA)
         map$ratio       <- factor(NA)
-        map$d50         <- factor(NA)
-        map$r_right <- factor(NA)
         keep <- !names(lower_bounds) %in% c("l50", "ratio", "d50", "r_right")
         lower_bounds <- lower_bounds[keep]
         upper_bounds <- upper_bounds[keep]
