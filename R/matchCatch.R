@@ -177,6 +177,9 @@ matchCatch <- function(params, species = NULL, catch, lambda = 2.05,
         default_bounds$r_right    <- NULL
     }
 
+    lower_bounds <- sapply(default_bounds, `[`, 1)
+    upper_bounds <- sapply(default_bounds, `[`, 2)
+
     # Lock parameters where necessary
     map <- list()
 
