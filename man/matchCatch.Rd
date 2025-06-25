@@ -2,19 +2,20 @@
 % Please edit documentation in R/matchCatch.R
 \name{matchCatch}
 \alias{matchCatch}
-\title{Match the observed catch and yield}
+\title{Match observed catch, yield and production with selectable sigmoid type}
 \usage{
 matchCatch(
   params,
   species = NULL,
   catch,
+  sel_type = c("double", "single"),
   lambda = 2.05,
   yield_lambda = 1,
   production_lambda = 1
 )
 }
 \arguments{
-\item{params}{A MizerParams object}
+\item{params}{A \code{MizerParams} object}
 
 \item{species}{The species for which to match the catch. Optional. By default
 all target species are selected. A vector of species names, or a numeric
@@ -29,6 +30,9 @@ contain the following columns:
 \item \code{count}: The observed count for each bin.
 }}
 
+\item{sel_type}{Character; either \code{"double"} (default) for dome-shaped
+selectivity, or \code{"single"} for a monotonic logistic.}
+
 \item{lambda}{The slope of the community spectrum. Default is 2.05.}
 
 \item{yield_lambda}{A parameter that controls the strength of the penalty for
@@ -39,75 +43,17 @@ for deviation from the observed production.}
 }
 \value{
 A MizerParams object with the adjusted external mortality, gear
-selectivity, catchability and steady-state spectrum for the selected
+selectivity, catchability and steady‐state spectrum for the selected
 species.
 }
 \description{
-This function adjusts various model parameters for the selected species so
-that the model in steady state reproduces the observed catch size
+This function adjusts the gear‐selectivity and mortality parameters for one
+species so that a steady‐state model reproduces the observed catch size
 distribution, the observed yield and the observed production, if available.
-}
-\details{
-Currently this function is implemented only for the case where there is a
-single gear catching each species.
-
-The function sets new values for the following parameters:
-\itemize{
-\item \code{l50}: The size at which the gear selectivity is 50\%.
-\item \code{l25}: The size at which the gear selectivity is 25\%.
-\item \code{catchability}: The catchability of the gear.
-\item \code{mu_mat}: The external mortality at maturity.
-}
-
-Only the parameters of the selected species are adjusted. The function then
-recalculates the corresponding rate arrays in the params object. It sets the
-initial size spectrum to the steady state size spectrum. The total biomass of
-each species remains unchanged.
-
-The function estimates these parameters by minimizing an objective function.
-The objective function is the negative log likelihood of the observed catch
-size distribution given the probabilities predicted by the model plus the sum
-of squares difference between the log of the observed yield and the log of
-the predicted yield, multiplied by \code{yield_lambda}, as well as the sum of
-squares difference between the log of the observed production and the log of
-the predicted production, multiplied by \code{production_lambda}.
-
-The function deals with missing data in the following way, for each species
-individually:
-\itemize{
-\item If the observed yield is not available, the function will only match the
-observed catch size distribution and the observed production.
-\item If the observed production is not available, the function will only match the
-observed catch size distribution and the observed yield.
-\item If the observed catch size distribution is not available, the function will
-only match the observed yield and the observed production.
-\item If neither the observed yield nor the observed production are available, the
-function raises an error.
-}
-
-The catch predicted by the model is calculated by integrating the
-catchability and the gear selectivity over the size distribution of the
-species. The size distribution itself is shaped by the model through the
-interplay between growth and mortality. This is why the gear selectivity and
-catchability need to be adjusted together with the other parameters that
-shape the size distribution.
-
-The objective function is coded in C++ and the TMB package is used to compile
-the objective function and to create functions for automatically calculating
-the gradients. These are then passed to the \code{nlminb} function to minimize the
-objective function.
 }
 \examples{
 params <- matchCatch(celtic_params, species = "Hake", catch = celtic_catch)
 plot_catch(params, species = "Hake", catch = celtic_catch)
-# The function leaves the biomass of the species unchanged
-all.equal(getBiomass(params), getBiomass(celtic_params), tol = 1e-4)
-# It also leaves the energy available to an individual for reproduction
-# and growth unchanged
-all.equal(getEReproAndGrowth(params), getEReproAndGrowth(celtic_params))
-# The initial size spectrum is set to the steady state size spectrum
-params_steady <- steadySingleSpecies(params)
-all.equal(initialN(params), initialN(params_steady))
 }
 \seealso{
 Other match functions: 
