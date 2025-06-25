@@ -16,8 +16,9 @@
 #' `l25_right` – length at 25 % *descending* selectivity
 #' (`r_right = l25_right / l50_right`, > 1)
 #'
-#' When `l50_right == l50` *and* `r_right == 1`, the curve collapses to the
-#' ordinary single‑sigmoid.
+#' For a single-sigmoid, the descending limb is fixed far to the right by setting
+#' d50 = 1 × 10^6 (matching length units) and r_right ≈ 1. This keeps
+#' S_right(l) ≈ 1 over the modelled size range.
 #'
 #' Only the parameters of the selected species are adjusted. The function then
 #' recalculates the corresponding rate arrays in the params object. It sets the
@@ -159,12 +160,11 @@ matchCatch <- function(params, species = NULL, catch, lambda = 2.05,
         r_right      = c(1.3, 4)
     )
 
-                # For single‐sigmoid we still *pass* these parameters to TMB,
-                    # but give them a small, finite value in the dome‐shaped code
-                    if (!use_double_sigmoid) {
-                          initial_params["d50"]        <- default_bounds$d50[1]       # 10
-                          initial_params["r_right"]<- default_bounds$r_right[1] # 1.1
-                        }
+    # ── SINGLE-SIGMOID OVERRIDE ─────────────────────────────────────────────
+    if (!use_double_sigmoid) {
+        initial_params$d50     <- 1e6      # park the descending limb far right
+        initial_params$r_right <- 1.0001   # >1 so the C++ maths stays finite
+    }
 
         lower_bounds <- sapply(default_bounds, `[`, 1)
         upper_bounds <- sapply(default_bounds, `[`, 2)
@@ -178,13 +178,13 @@ matchCatch <- function(params, species = NULL, catch, lambda = 2.05,
 
     # Lock right-hand sigmoid parameters if using single sigmoid
     if (!use_double_sigmoid) {
-        map$d50         <- factor(NA)
+        map$d50     <- factor(NA)
         map$r_right <- factor(NA)
+
         keep <- !names(lower_bounds) %in% c("d50", "r_right")
         lower_bounds <- lower_bounds[keep]
         upper_bounds <- upper_bounds[keep]
     }
-
 
     # Lock all selectivity parameters if no catch size data
     if (!data$use_counts) {
