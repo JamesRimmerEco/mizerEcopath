@@ -20,7 +20,10 @@ prepare_params <- function(p) {
     mat_idx <- colSums(outer(p@w, p@species_params$w_mat, "<"))
     mu_mat <- ext_mort(p)[cbind(seq_len(no_sp), mat_idx)]
     p <- set_species_param_default(p, "mu_mat", mu_mat)
+    p <- set_species_param_default(p, "d_over_g", 0.15)
 
+    p <- steadySingleSpecies(p)
+    p <- matchBiomasses(p)
     return(p)
 }
 
@@ -57,9 +60,9 @@ tuneParams_update_species <- function(sp, p, params, params_old) {
         p_old <- params_old()
         p@initial_n <- p_old@initial_n
 
-        p <- steadySingleSpecies(p)
-        p <- matchBiomasses(p)
-        p <- setBevertonHolt(p, reproduction_level = 0)
+        p <- steadySingleSpecies(p, species = sp)
+        p <- matchBiomasses(p, species = sp)
+        # p <- setBevertonHolt(p, reproduction_level = 0)
 
         # Update the reactive params object
         tuneParams_update_params(p, params)
