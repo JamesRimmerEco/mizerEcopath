@@ -286,11 +286,13 @@ obs_mean_ci <- function(x, counts, conf = 0.95) {
     n <- sum(counts)
     if (n == 0) return(c(mean = NA, lower = NA, upper = NA))
     p <- counts / n
-    m <- sum(x * p)
-    v <- sum(p * (x - m)^2) / n
-    se <- sqrt(v)
-    z <- qnorm(1 - (1 - conf) / 2)
-    c(mean = m, lower = m - z * se, upper = m + z * se)
+    B <- 10000
+    boot_means <- replicate(B, {
+        mean(sample(x, size = n, replace = TRUE, prob = p))
+    })
+    m <- mean(boot_means)
+    ci <- quantile(boot_means, c(1 - conf, conf))
+    c(mean = m, lower = ci[1], upper = ci[2])
 }
 
 
