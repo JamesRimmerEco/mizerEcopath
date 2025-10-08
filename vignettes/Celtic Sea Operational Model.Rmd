@@ -1,0 +1,286 @@
+---
+title: "Celtic Sea Operational Model"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.align = "center", fig.width = 7, fig.height = 4.5
+)
+# core packages
+suppressPackageStartupMessages({
+  library(mizer)
+  library(mizerEcopath)
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+  library(yaml)
+  library(remotes)
+  library(here)
+})
+```
+
+# Introduction
+
+This document builds the **Celtic Sea Operational Model** in mizer, a functional and reproducible configuration intended for forward projections and scenario analysis - for example, within a Shiny application.
+
+The goal is to produce a model suitable for use in interactive tools and policy exploration, not just for development testing. All parameter choices, data sources, and manual adjustments are recorded so the workflow remains transparent and repeatable.
+
+Manual tuning is required to align the model with empirical data (e.g. survey biomass, growth curves). These subjective adjustments are explicitly, and in future may be reinforced with improved algorithmic matching. 
+
+# Load Data
+
+Load in the csv and rds files which contain species and empirical data. This includes data from DATRAS, STECF, and data from an existing Ecopath model (Lauria et al. 2016, including ongoing updates under Bentley et al.).
+
+```{r}
+# Ensure  files exist and pause if any are missing 
+req_files <- c(
+  here("inst","extdata","Ecopath-Basic estimates.csv"),
+  here("inst","extdata","Ecopath-Fishing mortality rates.csv"),
+  here("inst","extdata","cs_scaled_landings.csv"),
+  here("inst","extdata","cs_survey.csv"),
+  here("inst","extdata","Celtic_Sea_Size_at_Age_Data.rds"),
+  here("inst","extdata","life_histories.csv"),
+  here("inst","extdata","cs_length_maturity_from_age_size_data.csv")
+)
+stopifnot(all(file.exists(req_files)))
+
+# Ecopath “basic estimates” (contains biomass, production, consumption etc.)
+ecopath_params <- read.csv(here("inst","extdata","Ecopath-Basic estimates.csv"))
+
+# Ecopath fishing mortality rates by fleet; we aggregate to a total catch proxy
+yield <- read.csv(here("inst","extdata","Ecopath-Fishing mortality rates.csv"))
+colnames(yield)[2] <- "Group.name"
+
+# Sum across all fleet columns to get a 'Total' F (column indices 3:29 in current file)
+# NOTE: This assumes the file layout is stable; if that changes, we will need to revisit this line.
+yield$Total <- rowSums(yield[, 3:29], na.rm = TRUE)
+
+# Join to basic estimates to compute total catch (t/km^2/yr) = Total * Biomass
+yield <- dplyr::left_join(
+  ecopath_params, yield,
+  by = c("Group.name" = "Group.name")
+) |>
+  dplyr::mutate(TotalCatch..t.km..year. = Total * Biomass..t.km.2.) |>
+  dplyr::select(Group.name, TotalCatch..t.km..year.)
+
+# ---- Landings (scaled) ----
+# Created in inst/Scaling Between Observed Landings and Ecopath.qmd:
+# takes landings-by-length from cs_catch.rds and applies a species-specific
+# scaling factor so totals match Ecopath catch (Ecopath-Basic estimates.csv +
+# Ecopath-Fishing mortality rates.csv). Output is per species × 1 cm length bin,
+# with scaled_catch and scaled_biomass in t/km^2 for model calibration.
+
+cs_scaled_landings <- read.csv(here("inst","extdata","cs_scaled_landings.csv"))
+
+# Keep only “total” gear for now (harmonised later when combining)
+cs_scaled_landings <- cs_scaled_landings[cs_scaled_landings$gear == "total", ]
+
+cs_scaled_landings <- cs_scaled_landings |>
+  # Round down length (floor)
+  dplyr::mutate(length = floor(length)) |>
+  dplyr::group_by(species, gear, length, Scientific_name) |>
+  dplyr::summarise(
+    catch   = sum(scaled_catch,   na.rm = TRUE),
+    biomass = sum(scaled_biomass, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Add columns expected downstream
+cs_scaled_landings$count <- cs_scaled_landings$catch
+cs_scaled_landings$dl    <- 1L # L ensures as integer
+cs_scaled_landings$gear  <- "landings"
+
+# Reorder to the expected column set/order
+cs_scaled_landings <- cs_scaled_landings[, c(
+  "species","Scientific_name","length","dl","gear","catch","count","biomass"
+)]
+
+# ---- Survey data (DATRAS-derived) ----
+# Created in inst/Processing DATRAS Fishing Survey.qmd:
+# aggregates DATRAS trawl survey data for the Celtic Sea to kg/km² by
+# species × 1 cm length bin, producing scaled catch and scaled biomass.
+cs_survey <- read.csv(here("inst","extdata","cs_survey.csv"))
+
+# Aggregate across gears into a single 'survey' gear
+cs_survey <- cs_survey |>
+  dplyr::group_by(species, Scientific_name, length, dl) |>
+  dplyr::summarise(
+    catch   = sum(scaled_catch,   na.rm = TRUE),
+    biomass = sum(scaled_biomass, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    count = catch,
+    gear  = "survey"
+  )
+
+# Combined 'catch' table used downstream
+catch <- rbind(cs_survey, cs_scaled_landings)
+
+# ---- Age–length data ----
+# Created in inst/Processing Size at Age.qmd:
+# Species-specific length–age relationships from DATRAS data for growth curves.
+age_at_length <- readRDS(here("inst","extdata","Celtic_Sea_Size_at_Age_Data.rds"))
+
+# ---- Life histories (FishBase-derived) ----
+# Contains length–weight parameters (a, b), maturity lengths (l_mat),
+# and maximum lengths standardised to total length (l_max).
+life_histories <- read.csv(here("inst","extdata","life_histories.csv"))
+
+life_histories_summary <- life_histories %>%
+  filter(Sex %in% c("Unsexed", "Mixed")) %>%      # keep Unsexed or Mixed
+  mutate(Scientific_name = Species) %>%           # duplicate Species to match maturity data
+  group_by(Species) %>%
+  # Pick row with l_mat if possible, else any row
+  slice(
+    if (any(!is.na(l_mat))) {
+      which(!is.na(l_mat))[1]  # first non-NA
+    } else {
+      1                        # first row if all NA
+    }
+  ) %>%
+  rename(l_mat1 = l_mat) %>%
+  mutate(
+    Scientific_name = Species,
+    l_max = case_when(
+      l_max_type == "TL" ~ l_max_fishbase,
+      l_max_type == "FL" ~ La + Lb * l_max_fishbase,
+      l_max_type == "SL" ~ La + Lb * l_max_fishbase
+    ),
+    l_max = ifelse(!is.na(l_max), l_max, l_max_fishbase)
+  ) %>%
+  ungroup()
+
+# ---- Maturity from processed size-at-age (DATRAS-based) ----
+# Created in inst/Processing Size at Age.qmd:
+# sets species-specific length at 50% maturity (L50) from DATRAS size-at-age data.
+lm <- read.csv(here("inst","extdata","cs_length_maturity_from_age_size_data.csv"))
+
+# Harmonise maturity column names: keep the processed L50 as l_mat2, then merge
+lm <- dplyr::rename(lm, l_mat2 = l50)
+
+# Join life histories with maturity; prefer l_mat2 (from processed data), else l_mat1
+sp_params <- dplyr::left_join(life_histories_summary, lm, by = "Scientific_name") |>
+  dplyr::mutate(
+    l_mat = dplyr::if_else(!is.na(l_mat2), l_mat2, l_mat1)
+  ) |>
+  dplyr::select(-l_mat2, -l_mat1)
+```
+
+# Step 1
+## 1.1 Species parameters
+
+We first assemble the species parameter table. We merge life-history information (length–weight, maturity length, maximum length) with Ecopath group names and ensure consistent species naming across all inputs.
+
+The goal is to produce a clean, merged object (sp) containing key size- and weight-related parameters for each species, which will be passed to Mizer for baseline parameterisation and later tuning.
+
+Inputs:
+
+life_histories_summary: (FishBase-derived: a, b, l_max, l_mat),
+lm: (processed DATRAS maturity; provides l_mat2 already merged),
+ecopath_params: (group names/biomass).
+
+```{r}
+# Mapping of model "common names" to scientific names used in Lauria/Ecopath
+species_map_lauria <- data.frame(
+  species = c("Herring","Cod","Haddock","Whiting","Blue whiting","Hake",
+              "Monkfish","Horse mackerel","Mackerel","Plaice","Megrim","Sole"),
+  Scientific_name = c("Clupea harengus","Gadus morhua","Melanogrammus aeglefinus",
+                      "Merlangius merlangus","Micromesistius poutassou","Merluccius merluccius",
+                      "Lophius piscatorius","Trachurus trachurus","Scomber scombrus",
+                      "Pleuronectes platessa","Lepidorhombus whiffiagonis","Solea solea")
+)
+
+# Start from sp_params (built previously by joining life_histories_summary + lm)
+sp <- sp_params %>%
+    # add computed columns first
+    mutate(
+        SciName = Species,                # keep scientific name
+        t0      = ifelse(is.na(t0), 0, t0),
+        l_mat=l_mat,
+        l_max=l_max,
+        w_mat   = a * (l_mat ^ b),       # weight at maturity
+        w_max   = a * (l_max ^ b),       # max weight
+        n       = 0.7,
+        p       = 0.7,
+        d       = n - 1,
+        alpha   = 0.8
+    ) %>%
+        # join common names
+    left_join(
+        species_map_lauria,
+        by = c("SciName" = "Scientific_name")
+    ) %>%
+    # overwrite species with common name
+    mutate(species = species) %>%
+    # keep desired columns
+    transmute(
+        species,     # common name 
+        SciName,     # scientific name 
+        w_inf,
+        k_vb,
+        l_mat,
+        l_max,
+        w_max,
+        w_mat,
+        a, b, t0,
+        n, p, d, alpha
+    )
+
+# Age at maturity from VB (needs w_inf, k_vb, t0)
+sp$age_mat <- mizer:::age_mat_vB(sp)
+
+```
+
+## 1.2 Add Ecopath Parameters
+
+Next, we link each modeled species to its corresponding Ecopath group(s) (stanza) and import biomass, production, and consumption parameters. Multi-stanza groups (e.g., Cod and Hake) are aggregated.
+
+```{r}
+species_to_groups <- list(
+    Herring       = "Herring",
+    Cod           = c("Cod", "Juvenile cod"),
+    Haddock       = c("Haddock","Juvenile haddock"),
+    Whiting       = c("Whiting","Juvenile whiting"),
+    `Blue whiting`= c("Blue whiting","Juvenile blue whiting"),
+    Hake          = c("Hake","Juvenile hake"),
+    Monkfish      = c("Monkfish","Juvenile monkfish"),
+    `Horse mackerel` = "Horse mackerel",
+    Mackerel      = "Mackerel",
+    Plaice        = c("Plaice","Juvenile plaice"),
+    Megrim        = c("Megrim","Juvenile megrim"),
+    Sole          = "Sole"
+)
+
+# Use addEcopathParams to validate and add Ecopath parameters to Mizer species.
+sp <- addEcopathParams(sp, ecopath_params, species_to_groups)
+```
+
+## 1.3 Update w_max from observations 
+
+We adjust each species’ maximum observed length (`l_max`) using the largest length recorded in the scaled landings dataset (`cs_scaled_landings`), which originates from **cs_catch.rds** (observed landings by length, STECF) scaled to match **Ecopath total catches**.
+
+```{r}
+observed_max <- cs_scaled_landings %>%
+  group_by(species) %>%
+  summarise(
+    obs_len = if (all(is.na(length + dl))) NA_real_ else max(length + dl, na.rm = TRUE)
+  )
+
+sp1 <- sp %>%
+    left_join(observed_max, by = "species")%>%
+    mutate(
+        l_max      = pmax(obs_len, l_max),
+        w_max        = a * l_max^b,
+    )
+```
