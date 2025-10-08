@@ -284,3 +284,21 @@ sp1 <- sp %>%
         w_max        = a * l_max^b,
     )
 ```
+
+## 1.4 Build non-interacting mizer model
+
+We next set up a 'non-interacting' mizer model where each species grows according to allometric rules independently of each other species in the assemblage. This essentially generates a series of independent baseline parameters for each species, ready to be matched to observation data. 
+
+The process is:
+1. Create allometric size spectra for each species.
+2. Add catch data (landings and survey).
+3. Assign observed biomasses from Ecopath for matching.
+4. Iteratively match growth, biomass, and consumption rates.
+5. Launch the shiny tool to facilitate fine hand-tuning alignment with observations. 
+
+This yields a functional, calibrated series of models (wrapped together under the umbrella of a single model) that matches expected growth and biomass, but unable yet to reproduce interspecific assemblage dynamics. 
+
+
+
+
+
