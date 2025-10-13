@@ -1,5 +1,5 @@
 ---
-title: "Celtic Sea Operational Model"
+title: "Celtic Sea Operational Model (diffusion)"
 output:
   html_document:
     toc: true
@@ -30,6 +30,8 @@ suppressPackageStartupMessages({
 ```
 
 # Introduction
+
+THIS VERSION HAS BEEN SENT UP TO USE DIFFUSION AND THE DIFFUSION FUNCTIONS OF MIZER AND MIZERECOPATH. THIS IS NOT PRESENTLY COMPATIBLE WITH THE FISHERIES APP. FOR THE PRESENT, THIS VERSION OF THE MODEL IS THEREFORE NOT IN USE.
 
 This document builds the **Celtic Sea Operational Model** in mizer, a functional and reproducible configuration intended for forward projections and scenario analysis - for example, within a Shiny application.
 
@@ -374,46 +376,20 @@ model_non_int <- addCatch(
   step     = 2
 )
 
+gp <- gear_params(model_non_int)
+
+# Make survey gear harmless
+gp$catchability[gp$gear == "survey"] <- 1e-7  # tiny q so F≈0
+gear_params(model_non_int) <- gp
+# Keep survey effort = 1 for plotting model lines
+
+
 # ---- Save a checkpoint to data ----
 chk_dir <- here("data")
 #saveRDS(model_non_int,   file.path(chk_dir, "model_untuned.rds"))  # landings ON, pre-tuning
 ```
 
-## 1.6 Manual tuning 
-For now, untick match biomass, growth, yield (+ consumption?). Shiny App currently unable to handle this, but still press match to run to steady. 
-
-Drop down tab in gadget (under fishing slider section) to switch between survey and landings data.
-
-```{r}
-#model_non_int   <- readRDS(file.path(chk_dir, "model_untuned.rds"))   # pre-tuning
-
-model_non_int_1 <- tuneEcopath(
-  model_non_int,
-  catch         = catch_all,     # <- obs lines will now draw
-  age_at_length = age_at_length
-)
-```
-
-For now - scale mortality sensibly (find a useful reference perhaps), then scale fishing perhaps, and try to tune around these.  
-
-Code chunk below: rounds of re-tuning with saved model object. 
-
-```{r, warning=FALSE, message=FALSE, error=FALSE}
-#model_non_int_1 <- readRDS(file.path(chk_dir, "model_tuned_1.rds"))  # post-tuner
-
-model_non_int_1 <- tuneEcopath(
-  model_non_int_1,
-  catch         = catch_all,     # <- obs lines will now draw
-  age_at_length = age_at_length
-)
-
-#saveRDS(model_non_int_1,   file.path(chk_dir, "model_tuned_1.rds"))  # landings ON, post/mid-tuning
-
-
-```
-
-
-## 1.7 Adding diet and preparing for interactions
+## 1.6 Adding diet and preparing for interactions
 In this step we add diet information to the model, using the updated Ecopath diet matrix (Ecopath-Diet_updated.csv).
 
 This enables the Diet tab in the tuning gadget for visual inspection and manual calibration of predator–prey preferences and kernel shapes, without yet activating interspecific interactions.
@@ -423,9 +399,82 @@ The diet matrix defines proportional feeding links between species, while the op
 Subsequent sections will use these inputs to initialise and then activate full trophic interactions.
 
 ```{r, warning=FALSE, message=FALSE, error=FALSE}
+## Build a species×species diet matrix from the updated Ecopath CSV,
 
+# Path to the reformatted diet matrix
+diet_csv_reformatted <- here("inst", "extdata", "Ecopath-Diet_updated_reformatted.csv")
+
+# Load the   diet matrix 
+ecopath_diet <- read.csv(diet_csv_reformatted, check.names = FALSE)
+
+# Build species×species diet matrix using the mapping already stored on species_params
+dm <- reduceEcopathDiet(
+  species_params = species_params(model_non_int),
+  ecopath_diet   = ecopath_diet,
+  ecopath_params = ecopath_params  # <- use the object loaded earlier
+)
+
+# Add predation kernels
+stom_path <- here("inst","extdata","stomach_data_fit.rds")
+if (file.exists(stom_path)) {
+  stomach_fits <- readRDS(stom_path)
+
+  sp <- species_params(model_non_int)  # has species (common) and SciName (scientific) from earlier
+  lambda <- 2                          # size-scaling exponent, matches your previous choice
+
+  # Pick the cleanest join key automatically: prefer scientific names
+  if ("species" %in% names(stomach_fits)) {
+    join_map <- c("SciName" = "species")
+  } else if ("Scientific_name" %in% names(stomach_fits)) {
+    join_map <- c("SciName" = "Scientific_name")
+  } else if ("Species" %in% names(stomach_fits)) { # sometimes capitalised
+    join_map <- c("SciName" = "Species")
+  } else {
+    join_map <- c("species" = "species")           # fall back to common names
+  }
+
+  # Build a row-aligned look-up for the species in the model
+  sf_aligned <- tibble(SciName = sp$SciName, species = sp$species) %>%
+    left_join(stomach_fits, by = join_map)
+
+  # Fields required in stomach_fits
+  sp$pred_kernel_type <- "power_law"
+  sp$kernel_exp <- sf_aligned$alpha + 4/3 - lambda
+  sp$kernel_l_l <- sf_aligned$ll
+  sp$kernel_u_l <- sf_aligned$ul
+  sp$kernel_l_r <- sf_aligned$lr
+  sp$kernel_u_r <- sf_aligned$ur
+
+  species_params(model_non_int) <- sp
+}
+
+# (optional) Save a checkpoint after wiring diet / before enabling interactions
+saveRDS(model_non_int, here("data","model_with_diet.rds"))
 
 ```
 
+## 1.7 Manual tuning 
+For now, untick match biomass, growth, yield (+ consumption?). Shiny App currently unable to handle this, but still press match to run to steady. 
 
+Drop down tab in gadget (under fishing slider section) to switch between survey and landings data.
+
+For now - scale mortality sensibly (find a useful reference perhaps), then scale fishing perhaps, and try to tune around these.  
+
+Code chunk below: rounds of re-tuning with saved model object. 
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+model_non_int_1 <- readRDS(file.path(chk_dir, "model_tuned_1.rds"))  # post-tuning revisions
+model_non_int <- readRDS(file.path(chk_dir, "model_tuned_1.rds"))  # pre-tuning loading (for reference)
+
+# IMPORTANT: Keep the model non-interacting for now (Diet tab is visual only).
+# Do NOT call matchDiet() yet. The gadget can display dm without turning interactions on.
+model_non_int_1 <- tuneEcopath(
+  model_non_int_1,
+  catch         = catch_all,     #
+  age_at_length = age_at_length,
+  diet          = dm             
+)
+
+#saveRDS(model_non_int_1,   file.path(chk_dir, "model_tuned_1.rds")) 
+```
 
