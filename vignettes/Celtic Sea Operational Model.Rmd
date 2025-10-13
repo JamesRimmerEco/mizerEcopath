@@ -27,6 +27,16 @@ suppressPackageStartupMessages({
   library(remotes)
   library(here)
 })
+
+# ---- Local package setup ----
+# Load mizerEcopath from a locally edited copy rather than GitHub.
+# This local version (0.1.0.9013) was installed from JEVER's fork
+# of the spawning_season branch with a modified DESCRIPTION file.
+# The modification relaxes the mizer dependency from >= 2.5.3.9012 to >= 2.5.3.9003
+# so it runs on the current master (non-diffusion) mizer build. 
+# If not loaded from local copy, use:
+# devtools::load_all("C:/Documents/York academic/Projects/R projects/mizerEcopath")
+
 ```
 
 # Introduction
@@ -44,3 +54,70 @@ Diet: we import an updated and reformatted Ecopath diet matrix.
 # Load Data
 
 Load in the csv and rds files which contain species and empirical data. This includes data from DATRAS, STECF, and data from an existing Ecopath model (Lauria et al. 2016, including ongoing updates under Bentley et al.).
+
+```{r}
+# ---- Check for the required files
+req_files <- c(
+  here("inst","extdata","Ecopath-Basic estimates.csv"),
+  here("inst","extdata","Ecopath-Fishing mortality rates.csv"),
+  here("inst","extdata","cs_scaled_landings.csv"),
+  here("inst","extdata","life_histories.csv")
+)
+stopifnot(all(file.exists(req_files)))
+
+# ---- Ecopath basic estimates ----
+ecopath_params <- read.csv(here("inst","extdata","Ecopath-Basic estimates.csv"))
+
+# ---- Ecopath fishing mortality 
+yield <- read.csv(here("inst","extdata","Ecopath-Fishing mortality rates.csv"))
+colnames(yield)[2] <- "Group.name"
+
+# Sum all fleet columns
+fleet_cols <- setdiff(seq_len(ncol(yield)), 1:2)
+yield$Total <- rowSums(yield[, fleet_cols, drop = FALSE], na.rm = TRUE)
+
+# Join to basic estimates to compute total catch (t/km^2/yr) = Total * Biomass
+yield <- dplyr::left_join(ecopath_params, yield, by = "Group.name") |>
+  dplyr::mutate(TotalCatch..t.km..year. = Total * Biomass..t.km.2.) |>
+  dplyr::select(Group.name, TotalCatch..t.km..year.)
+
+# ---- Landings (scaled; landings-only workflow) ----
+# Created in inst/Scaling Between Observed Landings and Ecopath.qmd
+cs_scaled_landings <- read.csv(here("inst","extdata","cs_scaled_landings.csv"))
+
+# Keep only total-gear rows; bin to 1 cm; aggregate
+cs_scaled_landings <- cs_scaled_landings[cs_scaled_landings$gear == "total", ] |>
+  dplyr::mutate(length = floor(length)) |>
+  dplyr::group_by(species, gear, length, Scientific_name) |>
+  dplyr::summarise(
+    catch   = sum(scaled_catch,   na.rm = TRUE),
+    biomass = sum(scaled_biomass, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Columns expected downstream
+cs_scaled_landings$count <- cs_scaled_landings$catch
+cs_scaled_landings$dl    <- 1L # L ensures as integer
+cs_scaled_landings$gear  <- "landings"
+
+# Reorder 
+cs_scaled_landings <- cs_scaled_landings[, c(
+  "species","Scientific_name","length","dl","gear","catch","count","biomass"
+)]
+
+# Combined catch table used downstream
+catch <- cs_scaled_landings
+
+# ---- Life histories (FishBase-derived; prefer Unsexed/Mixed; no size-at-age merge) ----
+life_histories <- read.csv(here("inst","extdata","life_histories.csv"))
+
+life_histories_summary <- life_histories %>%
+  dplyr::filter(Sex %in% c("Unsexed", "Mixed")) %>%
+  dplyr::group_by(Species) %>%
+  dplyr::slice(if (any(!is.na(l_mat))) which(!is.na(l_mat))[1] else 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(Scientific_name = Species)
+```
+
+
+
