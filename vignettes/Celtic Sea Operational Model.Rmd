@@ -1,0 +1,46 @@
+---
+title: "Celtic Sea Operational Model"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.align = "center", fig.width = 7, fig.height = 4.5
+)
+# core packages
+suppressPackageStartupMessages({
+  library(mizer)
+  library(mizerEcopath)
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+  library(yaml)
+  library(remotes)
+  library(here)
+})
+```
+
+# Introduction
+
+This document builds the **Celtic Sea Operational Model** in mizer using the **current ** (13.10.2025) main branch (no diffusion). t is configured for policy-facing projections and interactive exploration (e.g. with a Shiny front end) with an emphasis on reproducibility: all inputs, choices, and manual adjustments are recorded.
+
+Model scope & key choices
+
+Fishing data: landings-only gear constructed from updated landings-by-length (scaled to Ecopath totals). Survey gear is not included as seperate gear choices are not available for tuning in this mizer release.
+
+Calibration: matchGrowth(), steadySingleSpecies(), matchBiomasses(), and matchCatch() available in this mizer release. Age-at-length data are **not** used in this release - growth is (more loosely) matched to growth curves.
+
+Diet: we import an updated and reformatted Ecopath diet matrix.
+
+# Load Data
+
+Load in the csv and rds files which contain species and empirical data. This includes data from DATRAS, STECF, and data from an existing Ecopath model (Lauria et al. 2016, including ongoing updates under Bentley et al.).
