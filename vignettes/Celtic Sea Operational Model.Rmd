@@ -119,5 +119,87 @@ life_histories_summary <- life_histories %>%
   dplyr::mutate(Scientific_name = Species)
 ```
 
+# Step 1
+## 1.1 Species parameters
 
+We first assemble the species parameter table. We merge life-history information (length–weight, maturity length, maximum length) with Ecopath group names and ensure consistent species naming across all inputs.
+
+The goal is to produce a clean, merged object (sp) containing key size- and weight-related parameters for each species, which will be passed to Mizer for baseline parameterisation and later tuning.
+
+Inputs:
+
+life_histories_summary: (FishBase-derived: a, b, l_inf, k_vb, t0, l_max, l_mat),
+ecopath_params: (group names/biomass).
+
+Note: We no longer use processed DATRAS maturity (lm) or any size-at-age merges in this non-diffusion workflow.
+
+```{r}
+# Mapping of model "common names" to scientific names used in Lauria/Ecopath
+species_map_lauria <- data.frame(
+  species = c("Herring","Cod","Haddock","Whiting","Blue whiting","Hake",
+              "Monkfish","Horse mackerel","Mackerel","Plaice","Megrim","Sole"),
+  Scientific_name = c("Clupea harengus","Gadus morhua","Melanogrammus aeglefinus",
+                      "Merlangius merlangus","Micromesistius poutassou","Merluccius merluccius",
+                      "Lophius piscatorius","Trachurus trachurus","Scomber scombrus",
+                      "Pleuronectes platessa","Lepidorhombus whiffiagonis","Solea solea")
+)
+
+# Start from life_histories_summary (FishBase-derived only; no DATRAS maturity merge in this workflow)
+sp <- life_histories_summary %>%
+    # add computed columns first
+    mutate(
+        SciName = Species,                # keep scientific name
+        t0      = ifelse(is.na(t0), 0, t0),
+        # use l_mat as provided (FishBase-derived); we are not overriding with DATRAS
+        l_mat   = l_mat,
+
+        # ---- Recreate l_max as in old workflow ----
+        # Convert FL/SL to TL using La + Lb * value where available, else keep TL
+        l_max_from_type = dplyr::case_when(
+          !is.na(l_max_type) & l_max_type == "TL" ~ l_max_fishbase,
+          !is.na(l_max_type) & l_max_type %in% c("FL","SL") &
+            !is.na(La) & !is.na(Lb) ~ La + Lb * l_max_fishbase,
+          TRUE ~ NA_real_
+        ),
+        # NB: life_histories_summary may NOT have an existing `l_max` column,
+        # so don't reference it; compute a new one and expose later.
+        l_max_calc = dplyr::coalesce(l_max_from_type, l_max_fishbase),
+
+        # ensure w_inf is present; if missing, derive from L∞ and a,b
+        w_inf   = ifelse(!is.na(w_inf), w_inf,
+                         ifelse(!is.na(l_inf) & !is.na(a) & !is.na(b),
+                                a * (l_inf ^ b), NA_real_)),
+
+        w_mat   = a * (l_mat ^ b),       # weight at maturity
+        w_max   = a * (l_max_calc ^ b),  # max weight (from FishBase l_max)
+        n       = 0.7,
+        p       = 0.7,
+        d       = n - 1,
+        alpha   = 0.8
+    ) %>%
+    # join common names
+    left_join(
+        species_map_lauria,
+        by = c("SciName" = "Scientific_name")
+    ) %>%
+    # overwrite species with common name
+    mutate(species = species) %>%
+    # keep desired columns
+    transmute(
+        species,     # common name 
+        SciName,     # scientific name 
+        w_inf,
+        k_vb,
+        l_mat,
+        l_max = l_max_calc,
+        w_max,
+        w_mat,
+        a, b, t0,
+        n, p, d, alpha
+    )
+
+# Age at maturity from VB (needs w_inf, k_vb, t0)
+sp$age_mat <- mizer:::age_mat_vB(sp)
+
+```
 
