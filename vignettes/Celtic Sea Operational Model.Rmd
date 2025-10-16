@@ -17,6 +17,7 @@ knitr::opts_chunk$set(
 # core packages
 suppressPackageStartupMessages({
   library(mizer)
+  library(mizerExperimental)  
   library(mizerEcopath)
   library(dplyr)
   library(readr)
@@ -29,7 +30,7 @@ suppressPackageStartupMessages({
 })
 
 # ---- Local package setup ----
-# Load mizerEcopath from a locally edited copy rather than GitHub. This local version (0.1.0.9013) was installed from JEVER's fork of the spawning_season branch with a modified DESCRIPTION file. The modification relaxes the mizer dependency from >= 2.5.3.9012 to >= 2.5.3.9003 so it runs on the current master (non-diffusion) mizer build. If not loaded from local copy, use: 
+# We use a locally edited copy of mizerEcopath (0.1.0.9013) built against the diffusion/dev mizer (≥ 2.5.3.9012). This matches the environment in which the tuner was developed (exports age_mat_vB() etc.). Install/load mizer from the diffusion branch:
 # devtools::load_all("C:/Documents/York academic/Projects/R projects/mizerEcopath")
 ```
 
@@ -44,6 +45,93 @@ Fishing data: landings-only gear constructed from updated landings-by-length (sc
 Calibration: matchGrowth(), steadySingleSpecies(), matchBiomasses(), and matchCatch() available in this mizer release. Age-at-length data are **not** used in this release - growth is (more loosely) matched to growth curves.
 
 Diet: we import an updated and reformatted Ecopath diet matrix.
+
+# Modified helper functions (for newAllometricParams)
+
+Because the master (non-diffusion) build of mizer does not export the age_mat_vB() function required by newAllometricParams(), a small local compatibility function is added here. It reproduces the expected behaviour for estimating age at maturity from VB parameters and provides a matching newAllometricParams_compat() call that mirrors the original function. This ensures the model can be built on the diffusion-free mizer version without altering the wider workflow.
+
+```{r}
+# Local compatibility version mirroring mizer::age_mat_vB()
+age_mat_vB_compat <- function(object) {
+  ns <- try(getNamespace("mizer"), silent = TRUE)
+  if (!inherits(ns, "try-error") && exists("age_mat_vB", envir = ns, inherits = FALSE)) {
+    return(get("age_mat_vB", envir = ns, inherits = FALSE)(object))
+  }
+
+  if (inherits(object, "MizerParams")) {
+    sp <- object@species_params
+  } else {
+    if (!is.data.frame(object)) {
+      stop("The first argument must be either a MizerParams object or a species_params data frame.")
+    }
+    sp <- validSpeciesParams(object)
+  }
+
+  sp <- set_species_param_default(sp, "t0",   0)
+  sp <- set_species_param_default(sp, "b",    3)
+  sp <- set_species_param_default(sp, "k_vb", NA)
+  sp <- set_species_param_default(sp, "w_inf", sp$w_max)
+
+  a_mat <- -log(1 - (sp$w_mat / sp$w_inf)^(1 / sp$b)) / sp$k_vb + sp$t0
+  names(a_mat) <- sp$species
+  a_mat
+}
+
+
+newAllometricParams_compat <- function(species_params, no_w = 200) {
+  sp <- validGivenSpeciesParams(species_params)
+  sp <- set_species_param_default(sp, "n", 0.7)
+  sp$d <- sp$n - 1
+  sp <- set_species_param_default(sp, "alpha", 0.8)
+  sp$ks <- 0
+  sp$z0 <- 0
+
+  max_w <- max(sp$w_max)
+  p <- newMultispeciesParams(
+    sp, no_w = no_w, info_level = 0,
+    max_w = max_w, w_pp_cutoff = max_w * (1 + 1e-9),
+    resource_dynamics = "resource_constant"
+  )
+  sp <- p@species_params
+
+  interaction_matrix(p)[] <- 0
+  sp$interaction_resource <- 0
+  sp$h <- Inf
+  intake_max(p)[] <- Inf
+  species_params(p) <- sp
+
+  ext_encounter(p) <- t(outer(p@w, sp$n, "^"))
+  sp <- set_species_param_default(sp, "age_mat", age_mat_vB_compat(sp))
+  factor <- age_mat(p) / sp$age_mat
+  ext_encounter(p) <- sweep(ext_encounter(p), 1, factor, "*")
+  e0 <- getEGrowth(p)[, 1] / w(p)[1]^sp$n[1]
+
+  mu0 <- e0 * (1 + 0.2 - sp$n)
+  ext_mort(p) <- sweep(t(outer(p@w, sp$d, "^")), 1, mu0, "*")
+
+  p <- matchBiomasses(p)
+  p <- steadySingleSpecies(p, keep = "biomass")
+  p <- setBevertonHolt(p, reproduction_level = 0)
+  p
+}
+
+isAllometric_compat <- function(params, tol = 1e-5) {
+  sp <- params@species_params
+  sp <- set_species_param_default(sp, "d", sp$n - 1)
+  m <- getMort(params) - getFMort(params)
+  e <- getEncounter(params)
+  for (sp_name in sp$species) {
+    spc <- sp[sp_name, ]
+    mc <- m[sp_name, ] / params@w^spc$d
+    if (anyNA(mc) || any(is.nan(mc)) || any(mc < 0) || all(mc == 0)) stop("The model has invalid mortality rates.")
+    if (abs((max(mc) - min(mc)) / min(mc)) > tol) return(FALSE)
+    ec <- e[sp_name, ] / params@w^spc$n
+    if (anyNA(ec) || any(is.nan(ec)) || any(ec < 0) || all(ec == 0)) stop("The model has invalid encounter rates.")
+    if (abs((max(ec) - min(ec)) / min(ec)) > tol) return(FALSE)
+  }
+  TRUE
+}
+```
 
 # Load Data
 
@@ -193,7 +281,7 @@ sp <- life_histories_summary %>%
     )
 
 # Age at maturity from VB (needs w_inf, k_vb, t0)
-sp$age_mat <- age_mat_vB(sp)
+sp$age_mat <- age_mat_vB_compat(sp)
 
 ```
 
@@ -264,7 +352,7 @@ The process is:
 
 ```{r}
 # Set up independent (non-interacting) species spectra from sp
-model_non_int <- newAllometricParams(sp, no_w = 200)
+model_non_int <- newAllometricParams_compat(sp, no_w = 200)
 
 # Attach Ecopath-derived total catch targets used by matching
 # We created `yield` above with TotalCatch..t.km..year.; convert to expected column names
@@ -388,11 +476,11 @@ chk_dir <- here("data")
 
 # Landings data for tuning (must have species, length, dl, catch, gear)
 catch_for_tune <- cs_scaled_landings %>%
-  dplyr::mutate(
-    species = dplyr::recode(species, "Horse Mackerel" = "Horse mackerel"),
+  mutate(
+    species = recode(species, "Horse Mackerel" = "Horse mackerel"),
     gear    = "total"
   ) %>%
-  dplyr::transmute(
+  transmute(
     species,
     length,
     dl     = as.integer(dl),
