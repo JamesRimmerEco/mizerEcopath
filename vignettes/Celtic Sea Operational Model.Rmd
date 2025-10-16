@@ -30,8 +30,13 @@ suppressPackageStartupMessages({
 })
 
 # ---- Local package setup ----
-# We use a locally edited copy of mizerEcopath (0.1.0.9013) built against the diffusion/dev mizer (≥ 2.5.3.9012). This matches the environment in which the tuner was developed (exports age_mat_vB() etc.). Install/load mizer from the diffusion branch:
+# We use a locally edited copy of mizerEcopath (0.1.0.9013) with master mizer (>= 2.5.3.9003).
+# The master branch does not export age_mat_vB(), so we provide a small local
+# compatibility wrapper (age_mat_vB_compat) and a matching newAllometricParams_compat().
+
+# To load the local mizerEcopath source directly, use:
 # devtools::load_all("C:/Documents/York academic/Projects/R projects/mizerEcopath")
+
 ```
 
 # Introduction
