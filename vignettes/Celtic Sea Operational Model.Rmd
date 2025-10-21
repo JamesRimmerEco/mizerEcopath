@@ -568,7 +568,7 @@ widen_kernel_respecting_order <- function(p, sp_name,
   sp$kernel_l_r[i] <- rat_new[1]
   sp$kernel_u_r[i] <- rat_new[2]
 
-  # exponent tweak
+  # exponent adjust
   sp$kernel_exp[i] <- sp$kernel_exp[i] + delta_exp
 
   species_params(p) <- sp
@@ -583,8 +583,8 @@ widen_kernel_respecting_order <- function(p, sp_name,
 
 # Example:  X % widening for Cod, no exponent change
 model_non_int_1 <- widen_kernel_respecting_order(model_non_int_1, "Cod",
-                                                 factor_length = 1.25,
-                                                 factor_ratio  = 1.25,
+                                                 factor_length = 1.4,
+                                                 factor_ratio  = 1.4,
                                                  delta_exp     = 0)
 
 # Re-align growth before re-opening the tuner
@@ -592,7 +592,7 @@ model_non_int_1 <- matchGrowth(model_non_int_1)
 
 ```
 
-# Further tuning on existing model object
+# 1.9 Further tuning on existing model object
 
 Use this to reopen tuneEcopath on the current model (model_non_int_1) without rebuilding. We explicitly set controls so the UI initialises cleanly (the diffusion tab is shown but inert). The app is fed the scaled landings (catch_for_tune), an empty age–length placeholder (age_at_length_empty), and the Ecopath-reduced diet matrix (dm).
 
@@ -620,6 +620,112 @@ Comments to continue with:
 
 2) We're trying to combine information with reduceEcopathDiet from juvenile stanzas, but we have no good reason to believe it. We don't believe the juvenile ratio, so the biomass and thus consumption in the group is unbelieveable when combined. Only a problem in the mizer size based world if the juveniles eat something which the adults never do (from the assemblage). Could check for this in the diet matrix.
 
+# Post-hoc biomass adjustment
 
+This helper allows quick manual scaling of the observed biomass target for selected species after tuning. It’s intended for fine adjustments — useful when Ecopath totals look implausible. The change affects reproduction equilibrium only and does not alter gear selectivity or fishing mortality. After scaling, the model re-equilibrates with matchBiomasses() and steadySingleSpecies() to maintain balance.
 
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# Post-hoc: multiply observed biomass targets and show a simple before/after
+# - factors: named numeric vector (e.g. c("Megrim" = 1.4, "Cod" = 1.2))
+#            OR a 2-column data.frame: species, factor
+# - reequilibrate: if TRUE, run matchBiomasses() and steadySingleSpecies()
+# Returns the updated model and prints a table for changed species.
+scale_observed_biomass <- function(p, factors, reequilibrate = TRUE, digits = 3) {
+  sp <- species_params(p)
+  sp_names <- as.character(sp$species)
+
+  # Normalise `factors` to a named numeric vector
+  if (is.data.frame(factors)) {
+    if (ncol(factors) < 2) stop("Provide a 2-column data.frame: species, factor")
+    fvec <- setNames(as.numeric(factors[[2]]), as.character(factors[[1]]))
+  } else if (is.numeric(factors) && !is.null(names(factors))) {
+    fvec <- factors
+  } else {
+    stop("Provide a named numeric vector (names = species) or a 2-col data.frame.")
+  }
+
+  # Keep only species that exist in the model
+  hit <- intersect(names(fvec), sp_names)
+  if (!length(hit)) stop("None of the provided species match species_params$species")
+
+  # Save original targets
+  original_target <- setNames(as.numeric(sp$biomass_observed), sp_names)
+
+  # Apply multiplicative scaling to targets
+  idx <- match(hit, sp_names)
+  sp$biomass_observed[idx] <- sp$biomass_observed[idx] * fvec[hit]
+  species_params(p) <- sp
+
+  # Re-equilibrate if requested (by default runs matchBiomasses and steady).
+  if (reequilibrate) {
+    p <- matchBiomasses(p)
+    p <- steadySingleSpecies(p, keep = "biomass")
+  }
+
+  # New targets + realised biomasses from the model
+  sp_after <- species_params(p)
+  new_target <- setNames(as.numeric(sp_after$biomass_observed), as.character(sp_after$species))
+
+  realised_vec <- tryCatch(
+    getBiomass(p),
+    error = function(e) setNames(rep(NA_real_, length(sp_names)), sp_names)
+  )
+
+  # Small, readable comparison for the species you changed
+  out <- data.frame(
+    species             = hit,
+    original_target     = as.numeric(original_target[hit]),
+    new_target          = as.numeric(new_target[hit]),
+    realised            = as.numeric(realised_vec[hit]),
+    realised_to_target  = as.numeric(realised_vec[hit]) /
+                          pmax(as.numeric(new_target[hit]), .Machine$double.eps),
+    check.names = FALSE
+  )
+
+  # Pretty print (optional rounding)
+  num_cols <- vapply(out, is.numeric, logical(1))
+  out[num_cols] <- lapply(out[num_cols], function(x) signif(x, digits))
+  rownames(out) <- NULL
+  print(out)
+  invisible(p)
+}
+
+## Example usage:
+# factors <- c("Megrim" = 1.4, "Cod" = 1.2)
+# model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors)
+
+factors_cod <- c("Cod" = 1.5) # Other uses run in console, check with helper below
+model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors_cod, reequilibrate = TRUE)
+
+### Compare biomass in model to original to check for any changes:
+
+compare_biomass_to_ecopath <- function(mod) {
+  # Accept either an object or a character name
+  if (is.character(mod)) mod <- get(mod, envir = parent.frame())
+
+  adult_map <- data.frame(
+    species      = names(species_to_groups),
+    adult_stanza = vapply(species_to_groups, function(x) x[[1]], character(1))
+  )
+
+  ecopath_adult <- ecopath_params %>%
+    group_by(Group.name) %>%
+    summarise(bio_ecopath = sum(Biomass..t.km.2., na.rm = TRUE), .groups = "drop")
+
+  out <- species_params(mod) %>% as.data.frame() %>%
+    select(species, bio_model = biomass_observed) %>%
+    left_join(adult_map, by = "species") %>%
+    left_join(ecopath_adult, by = c("adult_stanza" = "Group.name")) %>%
+    mutate(ratio = bio_model / pmax(bio_ecopath, .Machine$double.eps)) %>%
+    arrange(desc(abs(log10(pmax(ratio, .Machine$double.eps))))) %>%
+    select(species, bio_ecopath, bio_model, ratio)
+
+  print(out, n = Inf)
+  invisible(out)
+}
+
+# example:
+compare_biomass_to_ecopath(model_non_int_1)
+
+```
 
