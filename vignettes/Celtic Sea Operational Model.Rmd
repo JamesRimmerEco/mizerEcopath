@@ -468,14 +468,10 @@ species_params(model_non_int) <- sp
 #saveRDS(model_non_int, here("data","model_non_int.rds"))
 ```
 
+## 1.8 Pre-tuning set up
+Sets up elements required before calling tuneEcopath
 
-## 1.7 Manual tuning 
-
-Rounds of re-tuning with saved model object. 
-
-```{r, warning=FALSE, message=FALSE, error=FALSE}
-## 1.7 Manual tuning ------------------------------------------------------------
-
+```{r}
 # Directory for checkpoints
 chk_dir <- here("data")
 
@@ -502,13 +498,53 @@ age_at_length_empty <- tibble::tibble(
   age     = integer(),
   count   = numeric()
 )
+```
 
+## 1.9 Add fishing mortality to allometric background
+After matching catches and yield, we can extract F (fishing mortality) in the fitted model, and add it to the allometric external mortality. Tuning can continue from there.
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# Add total fishing mortality (F) on top of existing external mortality
+# As such, first tune to create a F-tuned model, then extract the parameters from that. 
+add_F_to_extmort <- function(p, F) {
+  ext_mort(p) <- getExtMort(p) + F
+  p
+}
+
+## Tune to landings distribution and yield (start with model_non_int and switch to f_tuned_model if partially tuned):
+f_tuned_model <- tuneEcopath(
+    f_tuned_model,
+    controls = c("match","growth",
+                 "diffusion",
+                 "fishing",
+                 "reproduction",
+                 "other"),
+    catch         = catch_for_tune,
+    age_at_length = age_at_length_empty,
+    diet          = dm
+)
+
+# 1. Estimate F from the tuned model
+F_mat <- getFMort(f_tuned_model)
+
+# 2. Add F onto the model’s external mortality
+f_tuned_model <- add_F_to_extmort(f_tuned_model, F_mat)
+
+#saveRDS(f_tuned_model, here("data","f_tuned_model.rds"))
+
+```
+
+## 2 Manual tuning 
+
+Rounds of re-tuning with saved model object. 
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
 # Load the checkpoint saved at the end of 1.6 if required
-#model_non_int <- readRDS(file.path(chk_dir, "model_non_int.rds"))
+#f_tuned_model <- readRDS(file.path(chk_dir, "f_tuned_model.rds"))
 
 # Run the tuner - diffusion sliders will appear but have no effect on the model. 
 model_non_int_1 <- tuneEcopath(
-    model_non_int,
+    f_tuned_model,
     controls = c("match","growth",
                  "diffusion",
                  "fishing",
@@ -526,7 +562,31 @@ model_non_int_1 <- tuneEcopath(
 
 ```
 
-# 1.8 Kernel adjustment
+# 2.1 Further tuning on existing model object
+
+Use this to reopen tuneEcopath on the current model (model_non_int_1) without rebuilding. We explicitly set controls so the UI initialises cleanly (the diffusion tab is shown but inert). The app is fed the scaled landings (catch_for_tune), an empty age–length placeholder (age_at_length_empty), and the Ecopath-reduced diet matrix (dm).
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# Area to rework partially tuned model
+model_non_int_1 <- tuneEcopath(
+    model_non_int_1,
+    controls = c("match","growth",
+                 "diffusion",
+                 "fishing",
+                 "reproduction",
+                 "other"),
+    catch         = catch_for_tune,
+    age_at_length = age_at_length_empty,
+    diet          = dm
+)
+
+# saveRDS(model_non_int_1, file.path(chk_dir, "model_tuned_1.rds"))
+```
+
+# Post-hoc helpers
+Sections below contain helpers which can be used to make changes to the feeding kernels and observed biomasses of species.
+
+# Post-hoc: Kernel adjustment
 
 Use this section to edits to the predator–prey kernels). After any change, re-run matchGrowth(model_non_int_1) to re-equilibrate growth with the new kernel before reopening tuneEcopath.
 
@@ -592,35 +652,7 @@ model_non_int_1 <- matchGrowth(model_non_int_1)
 
 ```
 
-# 1.9 Further tuning on existing model object
-
-Use this to reopen tuneEcopath on the current model (model_non_int_1) without rebuilding. We explicitly set controls so the UI initialises cleanly (the diffusion tab is shown but inert). The app is fed the scaled landings (catch_for_tune), an empty age–length placeholder (age_at_length_empty), and the Ecopath-reduced diet matrix (dm).
-
-```{r, warning=FALSE, message=FALSE, error=FALSE}
-# Area to rework partially tuned model
-model_non_int_1 <- tuneEcopath(
-    model_non_int_1,
-    controls = c("match","growth",
-                 "diffusion",
-                 "fishing",
-                 "reproduction",
-                 "other"),
-    catch         = catch_for_tune,
-    age_at_length = age_at_length_empty,
-    diet          = dm
-)
-
-# saveRDS(model_non_int_1, file.path(chk_dir, "model_tuned_1.rds"))
-```
-
-
-Comments to continue with:
-
-1) Consider changing (but flagging up) Ecopath observations. For Megrim, might need to increase biomass.
-
-2) We're trying to combine information with reduceEcopathDiet from juvenile stanzas, but we have no good reason to believe it. We don't believe the juvenile ratio, so the biomass and thus consumption in the group is unbelieveable when combined. Only a problem in the mizer size based world if the juveniles eat something which the adults never do (from the assemblage). Could check for this in the diet matrix.
-
-# Post-hoc biomass adjustment
+# Post-hoc: Biomass adjustment
 
 This helper allows quick manual scaling of the observed biomass target for selected species after tuning. It’s intended for fine adjustments — useful when Ecopath totals look implausible. The change affects reproduction equilibrium only and does not alter gear selectivity or fishing mortality. After scaling, the model re-equilibrates with matchBiomasses() and steadySingleSpecies() to maintain balance.
 
@@ -694,7 +726,7 @@ scale_observed_biomass <- function(p, factors, reequilibrate = TRUE, digits = 3)
 # factors <- c("Megrim" = 1.4, "Cod" = 1.2)
 # model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors)
 
-factors_cod <- c("Cod" = 1.5) # Other uses run in console, check with helper below
+factors_cod <- c("Whiting" = 1.5) # Other uses run in console, check with helper below
 model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors_cod, reequilibrate = TRUE)
 
 ### Compare biomass in model to original to check for any changes:
@@ -720,7 +752,7 @@ compare_biomass_to_ecopath <- function(mod) {
     arrange(desc(abs(log10(pmax(ratio, .Machine$double.eps))))) %>%
     select(species, bio_ecopath, bio_model, ratio)
 
-  print(out, n = Inf)
+  print(out)
   invisible(out)
 }
 
@@ -728,4 +760,7 @@ compare_biomass_to_ecopath <- function(mod) {
 compare_biomass_to_ecopath(model_non_int_1)
 
 ```
+
+
+
 
