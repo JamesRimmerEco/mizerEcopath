@@ -468,7 +468,7 @@ species_params(model_non_int) <- sp
 #saveRDS(model_non_int, here("data","model_non_int.rds"))
 ```
 
-## 1.8 Pre-tuning set up
+## 1.7 Pre-tuning set up
 Sets up elements required before calling tuneEcopath
 
 ```{r}
@@ -500,53 +500,17 @@ age_at_length_empty <- tibble::tibble(
 )
 ```
 
-## 1.9 Add fishing mortality to allometric background
-After matching catches and yield, we can extract F (fishing mortality) in the fitted model, and add it to the allometric external mortality. Tuning can continue from there.
-
-```{r, warning=FALSE, message=FALSE, error=FALSE}
-# Add total fishing mortality (F) on top of existing external mortality
-# As such, first tune to create a F-tuned model, then extract the parameters from that. 
-add_F_to_extmort <- function(p, F) {
-  ext_mort(p) <- getExtMort(p) + F
-  p
-}
-
-## Tune to landings distribution and yield (start with model_non_int and switch to f_tuned_model if partially tuned):
-f_tuned_model <- tuneEcopath(
-    f_tuned_model,
-    controls = c("match","growth",
-                 "diffusion",
-                 "fishing",
-                 "reproduction",
-                 "other"),
-    catch         = catch_for_tune,
-    age_at_length = age_at_length_empty,
-    diet          = dm
-)
-
-#saveRDS(f_tuned_model, here("data","f_tuned_model.rds"))
-# Load the checkpoint if required - will need to call add_F_to_extmort on this object.
-#f_tuned_model <- readRDS(file.path(chk_dir, "f_tuned_model.rds"))
-
-# 1. Estimate F from the tuned model
-F_mat <- getFMort(f_tuned_model)
-
-# 2. Add F onto the model’s external mortality
-f_tuned_model_MORT <- add_F_to_extmort(f_tuned_model, F_mat)
-
-```
-
-## 2 Manual tuning 
+# 2 Manual tuning 
 
 Rounds of re-tuning with saved model object. 
 
 ```{r, warning=FALSE, message=FALSE, error=FALSE}
 # Load the checkpoint saved at the end of 1.6 if required
-#f_tuned_model <- readRDS(file.path(chk_dir, "f_tuned_model.rds"))
+#model_non_int <- readRDS(file.path(chk_dir, "model_non_int.rds"))
 
 # Run the tuner - diffusion sliders will appear but have no effect on the model.  Reuse model_non_int_1 as the base object if partially tuned.
 model_non_int_1 <- tuneEcopath(
-    f_tuned_model_MORT,
+    model_non_int,
     controls = c("match","growth",
                  "diffusion",
                  "fishing",
@@ -564,13 +528,15 @@ model_non_int_1 <- tuneEcopath(
 
 ```
 
-# 2.1 Further tuning on existing model object
+## 2.1 Further tuning on existing model object
 
 Use this to reopen tuneEcopath on the current model (model_non_int_1) without rebuilding. We explicitly set controls so the UI initialises cleanly (the diffusion tab is shown but inert). The app is fed the scaled landings (catch_for_tune), an empty age–length placeholder (age_at_length_empty), and the Ecopath-reduced diet matrix (dm).
 
 ```{r, warning=FALSE, message=FALSE, error=FALSE}
-# Area to rework partially tuned model
-model_non_int_1 <- tuneEcopath(
+#model_non_int_1 <- readRDS(file.path(chk_dir, "model_tuned_1.rds"))
+
+#Area to rework partially tuned model
+    model_non_int_1 <- tuneEcopath(
     model_non_int_1,
     controls = c("match","growth",
                  "diffusion",
@@ -586,75 +552,53 @@ model_non_int_1 <- tuneEcopath(
 ```
 
 # Post-hoc helpers
-Sections below contain helpers which can be used to make changes to the feeding kernels and observed biomasses of species.
+Sections below contain helpers which can be used to make changes to the feeding kernels and observed biomasses of species. May help if the size distribution curtails too early in the model vs observed.
 
-# Post-hoc: Kernel adjustment
+## Post hoc: Asymptotic size adjustment
 
-Use this section to edits to the predator–prey kernels). After any change, re-run matchGrowth(model_non_int_1) to re-equilibrate growth with the new kernel before reopening tuneEcopath.
-
-```{r, warning=FALSE, message=FALSE, error=FALSE}
-
-#model_non_int_1 <- readRDS(file.path(chk_dir, "model_tuned_1.rds"))
-
-# widen_kernel_respecting_order(): expands each interval around its midpoint,
-# then writes back with the SAME original order (no swapping).
-widen_kernel_respecting_order <- function(p, sp_name,
-                                          factor_length = 1.15,
-                                          factor_ratio  = 1.15,
-                                          delta_exp     = 0) {
-  sp <- species_params(p); i <- match(sp_name, sp$species); stopifnot(!is.na(i))
-
-  # helpers: expand [a,b] by factor around midpoint, but return in original order
-  expand_keep_order <- function(lo, hi, factor) {
-    # keep original order
-    orig_lo <- lo; orig_hi <- hi
-    a <- min(lo, hi); b <- max(lo, hi)
-    mid <- (a + b) / 2
-    half <- (b - a) / 2
-    half_new <- half * factor
-    a2 <- mid - half_new
-    b2 <- mid + half_new
-    # restore original order
-    if (orig_lo <= orig_hi) c(a2, b2) else c(b2, a2)
-  }
-
-  old <- sp[i, c("kernel_l_l","kernel_u_l","kernel_l_r","kernel_u_r","kernel_exp"), drop = FALSE]
-
-  # length-ratio window
-  len_new <- expand_keep_order(sp$kernel_l_l[i], sp$kernel_u_l[i], factor_length)
-  sp$kernel_l_l[i] <- len_new[1]
-  sp$kernel_u_l[i] <- len_new[2]
-
-  # mass-ratio window
-  rat_new <- expand_keep_order(sp$kernel_l_r[i], sp$kernel_u_r[i], factor_ratio)
-  sp$kernel_l_r[i] <- rat_new[1]
-  sp$kernel_u_r[i] <- rat_new[2]
-
-  # exponent adjust
-  sp$kernel_exp[i] <- sp$kernel_exp[i] + delta_exp
-
-  species_params(p) <- sp
-
-  message(sprintf(
-    "%s kernel: L[%g,%g] R[%g,%g] exp=%g  -->  L[%g,%g] R[%g,%g] exp=%g",
-    sp_name, old$kernel_l_l, old$kernel_u_l, old$kernel_l_r, old$kernel_u_r, old$kernel_exp,
-    sp$kernel_l_l[i], sp$kernel_u_l[i], sp$kernel_l_r[i], sp$kernel_u_r[i], sp$kernel_exp[i]
-  ))
-  p
-}
-
-# Example:  X % widening for Cod, no exponent change
-model_non_int_1 <- widen_kernel_respecting_order(model_non_int_1, "Cod",
-                                                 factor_length = 1.4,
-                                                 factor_ratio  = 1.4,
-                                                 delta_exp     = 0)
-
-# Re-align growth before re-opening the tuner
-model_non_int_1 <- matchGrowth(model_non_int_1)
-
+```{r}
+#model_non_int_1@species_params$w_repro_max[6]<-1400 
 ```
 
-# Post-hoc: Biomass adjustment
+## Post-hoc: Kernel adjustment
+
+Use this section to edits to the predator–prey kernels.
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# Choose model
+p <- model_non_int_1 
+
+# Locate Hake row
+i <- match("Hake", species_params(p)$species)
+
+# Backup current values so they can be reverted easily
+sp <- species_params(p)
+backup_hake <- sp[i, c("kernel_l_l","kernel_u_l","kernel_l_r","kernel_u_r","kernel_exp")]
+print(backup_hake)
+
+# Show current cut-offs on PPMR (mass ratio) scale for intuition (value is factor bigger of the predator than the prey).
+cat("Current cut-offs on PPMR scale:\n")
+cat("  lower (start-eating)  ~", exp(sp$kernel_l_l[i]), "\n")
+cat("  upper (stop-eating)   ~", exp(sp$kernel_l_r[i]), "\n")
+
+# --- Move Hake's lower cutoff to prey ≈ 1/10 of predator mass (PPMR = 10) ---
+# (Previously around 80x: exp(sp$kernel_l_l[i]) ~ 80)
+#sp$kernel_l_l[i] <- log(10)   # ≈ 2.302585; shifts rising sigmoid right to PPMR=10
+
+# Write back and rebuild kernel lookups
+species_params(p) <- sp
+p <- setPredKernel(p)
+
+# Inspect new PPMR cut-offs
+cat("New cut-offs on PPMR scale:\n")
+cat("  lower ~", exp(species_params(p)$kernel_l_l[i]), "\n")
+cat("  upper ~", exp(species_params(p)$kernel_l_r[i]), "\n")
+
+# Finally put into the real model
+model_non_int_1 <- p
+```
+
+## Post-hoc: Biomass adjustment
 
 This helper allows quick manual scaling of the observed biomass target for selected species after tuning. It’s intended for fine adjustments — useful when Ecopath totals look implausible. The change affects reproduction equilibrium only and does not alter gear selectivity or fishing mortality. After scaling, the model re-equilibrates with matchBiomasses() and steadySingleSpecies() to maintain balance.
 
@@ -728,8 +672,10 @@ scale_observed_biomass <- function(p, factors, reequilibrate = TRUE, digits = 3)
 # factors <- c("Megrim" = 1.4, "Cod" = 1.2)
 # model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors)
 
-factors_cod <- c("Whiting" = 1.5) # Other uses run in console, check with helper below
-model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors_cod, reequilibrate = TRUE)
+####    Use biomass rescaler    ######################
+factors_fish_biomass <- c("Whiting" = 2) # Other uses run in console, check with helper below
+model_non_int <- scale_observed_biomass(model_non_int, factors_fish_biomass, reequilibrate = TRUE)
+######################################################
 
 ### Compare biomass in model to original to check for any changes:
 
@@ -759,12 +705,51 @@ compare_biomass_to_ecopath <- function(mod) {
 }
 
 # example:
-compare_biomass_to_ecopath(model_non_int_1)
+compare_biomass_to_ecopath(model_non_int)
 
 ```
 
+# Comments
 
-### Note to self for later:
-Reversed all changes to catchSeletivity. We don't need F to be below the allometric background, only predator mortality. So, comment that all out, rebuild a non interacting model, and worry ONLY about fitting predation below the mortality curve.
+use compareParams to see which model properties have changed between model iterations.
 
-Take all the no longer needed bits and bring them down. 
+# Redundant code - kept for reference only
+
+## x1 Add fishing mortality to allometric background
+
+# THIS SECTION IS NOW UNREQUIRED
+
+After matching catches and yield, we can extract F (fishing mortality) in the fitted model, and add it to the allometric external mortality. Tuning can continue from there.
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# Add total fishing mortality (F) on top of existing external mortality
+# As such, first tune to create a F-tuned model, then extract the parameters from that. 
+add_F_to_extmort <- function(p, F) {
+  ext_mort(p) <- getExtMort(p) + F
+  p
+}
+
+## Tune to landings distribution and yield (start with model_non_int and switch to f_tuned_model if partially tuned):
+f_tuned_model <- tuneEcopath(
+    f_tuned_model,
+    controls = c("match","growth",
+                 "diffusion",
+                 "fishing",
+                 "reproduction",
+                 "other"),
+    catch         = catch_for_tune,
+    age_at_length = age_at_length_empty,
+    diet          = dm
+)
+
+#saveRDS(f_tuned_model, here("data","f_tuned_model.rds"))
+# Load the checkpoint if required - will need to call add_F_to_extmort on this object.
+#f_tuned_model <- readRDS(file.path(chk_dir, "f_tuned_model.rds"))
+
+# 1. Estimate F from the tuned model
+F_mat <- getFMort(f_tuned_model)
+
+# 2. Add F onto the model’s external mortality
+f_tuned_model_MORT <- add_F_to_extmort(f_tuned_model, F_mat)
+
+```
