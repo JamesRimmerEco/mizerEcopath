@@ -536,7 +536,7 @@ Use this to reopen tuneEcopath on the current model (model_non_int_1) without re
 #model_non_int_1 <- readRDS(file.path(chk_dir, "model_tuned_1.rds"))
 
 #Area to rework partially tuned model
-    model_non_int_1 <- tuneEcopath(
+model_non_int_1 <- tuneEcopath(
     model_non_int_1,
     controls = c("match","growth",
                  "diffusion",
@@ -557,7 +557,11 @@ Sections below contain helpers which can be used to make changes to the feeding 
 ## Post hoc: Asymptotic size adjustment
 
 ```{r}
-#model_non_int_1@species_params$w_repro_max[6]<-1400 
+model_non_int_1@species_params$species
+#model_non_int_1@species_params$w_repro_max[6] <- 1400 
+#model_non_int_1@species_params$w_repro_max[3] <- 1250 
+#model_non_int_1@species_params$w_repro_max[11] <- 1000 
+model_non_int_1 <- setReproduction(model_non_int_1)
 ```
 
 ## Post-hoc: Kernel adjustment
@@ -569,7 +573,7 @@ Use this section to edits to the predator–prey kernels.
 p <- model_non_int_1 
 
 # Locate Hake row
-i <- match("Hake", species_params(p)$species)
+i <- match("Megrim", species_params(p)$species)
 
 # Backup current values so they can be reverted easily
 sp <- species_params(p)
@@ -584,6 +588,10 @@ cat("  upper (stop-eating)   ~", exp(sp$kernel_l_r[i]), "\n")
 # --- Move Hake's lower cutoff to prey ≈ 1/10 of predator mass (PPMR = 10) ---
 # (Previously around 80x: exp(sp$kernel_l_l[i]) ~ 80)
 #sp$kernel_l_l[i] <- log(10)   # ≈ 2.302585; shifts rising sigmoid right to PPMR=10
+
+# --- Move Megrim's lower cutoff to prey ≈ 1/30 of predator mass  ---
+# (Previously around 50x)
+#sp$kernel_l_l[i] <- log(30)   
 
 # Write back and rebuild kernel lookups
 species_params(p) <- sp
