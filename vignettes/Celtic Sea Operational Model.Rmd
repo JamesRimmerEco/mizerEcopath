@@ -207,7 +207,840 @@ life_histories_summary <- life_histories %>%
   mutate(Scientific_name = Species)
 ```
 
-# Step 1
+# 1 Building the untuned model
+## 1.1 Species parameters
+
+We first assemble the species parameter table. We merge life-history information (length–weight, maturity length, maximum length) with Ecopath group names and ensure consistent species naming across all inputs.
+
+The goal is to produce a clean, merged object (sp) containing key size- and weight-related parameters for each species, which will be passed to Mizer for baseline parameterisation and later tuning.
+
+Inputs:
+
+life_histories_summary: (FishBase-derived: a, b, l_inf, k_vb, t0, l_max, l_mat),
+ecopath_params: (group names/biomass).
+
+Note: We no longer use processed DATRAS maturity (lm) or any size-at-age merges in this non-diffusion workflow.
+
+```{r}
+# Mapping of model "common names" to scientific names used in Lauria/Ecopath
+species_map_lauria <- data.frame(
+  species = c("Herring","Cod","Haddock","Whiting","Blue whiting","Hake",
+              "Monkfish","Horse mackerel","Mackerel","Plaice","Megrim","Sole"),
+  Scientific_name = c("Clupea harengus","Gadus morhua","Melanogrammus aeglefinus",
+                      "Merlangius merlangus","Micromesistius poutassou","Merluccius merluccius",
+                      "Lophius piscatorius","Trachurus trachurus","Scomber scombrus",
+                      "Pleuronectes platessa","Lepidorhombus whiffiagonis","Solea solea")
+)
+
+# Start from life_histories_summary (FishBase-derived only)
+sp <- life_histories_summary %>%
+    # add computed columns first
+    mutate(
+        SciName = Species,                # keep scientific name
+        t0      = ifelse(is.na(t0), 0, t0),
+        l_mat   = l_mat,
+
+                # ---- Create l_max ----
+        # Convert FL/SL to TL using La + Lb * value where available, else keep TL
+        l_max_from_type = case_when(
+          !is.na(l_max_type) & l_max_type == "TL" ~ l_max_fishbase,
+          !is.na(l_max_type) & l_max_type %in% c("FL","SL") &
+            !is.na(La) & !is.na(Lb) ~ La + Lb * l_max_fishbase,
+          TRUE ~ NA_real_
+        ),
+        # NB: life_histories_summary may NOT have an existing `l_max` column,
+        # so don't reference it; calculate a new one and expose later.
+        l_max_calc = coalesce(l_max_from_type, l_max_fishbase),
+
+        # ensure w_inf is present; if missing, derive from L∞ and a,b
+        w_inf   = ifelse(!is.na(w_inf), w_inf,
+                         ifelse(!is.na(l_inf) & !is.na(a) & !is.na(b),
+                                a * (l_inf ^ b), NA_real_)),
+
+        w_mat   = a * (l_mat ^ b),       # weight at maturity
+        w_max   = a * (l_max_calc ^ b),  # max weight (from FishBase l_max)
+        n       = 0.7,
+        p       = 0.7,
+        d       = n - 1,
+        alpha   = 0.8
+    ) %>%
+    # join common names
+    left_join(
+        species_map_lauria,
+        by = c("SciName" = "Scientific_name")
+    ) %>%
+    # overwrite species with common name
+    mutate(species = species) %>%
+    # keep desired columns
+    transmute(
+        species,     # common name 
+        SciName,     # scientific name 
+        w_inf,
+        k_vb,
+        l_mat,
+        l_max = l_max_calc,
+        w_max,
+        w_mat,
+        a, b, t0,
+        n, p, d, alpha
+    )
+
+# Age at maturity from VB (needs w_inf, k_vb, t0)
+sp$age_mat <- age_mat_vB_compat(sp)
+
+```
+
+## 1.2 Add Ecopath Parameters
+
+Next, we link each modeled species to its corresponding Ecopath group(s) (stanza) and import biomass, production, and consumption parameters. Multi-stanza groups (e.g., Cod and Hake) are aggregated.
+
+```{r}
+species_to_groups <- list(
+    Herring          = "Herring",
+    Cod              = c("Cod", "Juvenile cod"),
+    Haddock          = c("Haddock","Juvenile haddock"),
+    Whiting          = c("Whiting","Juvenile whiting"),
+    `Blue whiting`   = c("Blue whiting","Juvenile blue whiting"),
+    Hake             = c("Hake","Juvenile hake"),
+    Monkfish         = c("Monkfish","Juvenile monkfish"),
+    `Horse mackerel` = "Horse mackerel",
+    Mackerel         = "Mackerel",
+    Plaice           = c("Plaice","Juvenile plaice"),
+    Megrim           = c("Megrim","Juvenile megrim"),
+    Sole             = "Sole"
+)
+
+# Use addEcopathParams to validate and add parameters from Ecopath to each species.
+sp <- addEcopathParams(sp, ecopath_params, species_to_groups)
+```
+
+## 1.3 Update w_max from observations 
+
+We adjust each species’ maximum observed length (`l_max`) using the largest length recorded in the scaled landings dataset (`cs_scaled_landings`), which originates from **cs_catch.rds** (observed landings by length, STECF) scaled to match **Ecopath total catches**.
+
+```{r}
+## 1.3 Update w_max from observations 
+# Use the largest observed length in the (scaled) landings and give a modest buffer.
+
+observed_max <- cs_scaled_landings %>%
+  group_by(species) %>%
+  summarise(
+    obs_len = max(length + dl, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+sp <- sp %>%
+  left_join(observed_max, by = "species") %>%
+  mutate(
+    # keep l_max if already larger; otherwise raise it up to the observed max
+    l_max = if_else(!is.na(obs_len) & obs_len > l_max, obs_len, l_max),
+    # set w_max with a 20% buffer 
+    len_for_max = coalesce(obs_len, l_max),
+    w_max       = 1.2 * a * (len_for_max ^ b),
+    # match Lauria’s practice of setting the upper reproductive weight to w_inf
+    w_repro_max = w_inf
+  ) %>%
+  select(-len_for_max, -obs_len)
+
+```
+
+## 1.4 Build non‑interacting mizer model
+
+We next set up a 'non‑interacting' mizer model where each species grows according to allometric rules independently of each other species in the assemblage. This essentially generates a series of independent baseline parameters for each species, ready to be matched to observation data.
+
+The process is:
+
+1. Create allometric size spectra for each species.
+2. Add Ecopath total catch targets (for catch matching).
+3. Assign observed biomasses from Ecopath for matching.
+4. Iteratively match growth, biomass, and consumption rates.
+
+```{r}
+# Set up independent (non-interacting) species spectra from sp
+model_non_int <- newAllometricParams_compat(sp, no_w = 200)
+
+# Attach Ecopath-derived total catch targets used by matching
+# We created `yield` above with TotalCatch..t.km..year.; convert to expected column names
+catch_df <- yield %>%
+  transmute(
+    `Group name` = Group.name,
+    `TotalCatch (t/km²/year)` = TotalCatch..t.km..year.
+  )
+
+model_non_int <- addEcopathCatchTotal(model_non_int, catch_df)
+
+# ---- Match growth & biomass to observations ----
+# Map each species to its adult stanza and join adult biomass from Ecopath.
+# We collapse Ecopath to one row per group name to stay robust if the file contains duplicates.
+adult_map <- tibble::tibble(
+  species      = names(species_to_groups),
+  adult_stanza = vapply(species_to_groups, function(x) x[[1]], character(1))
+)
+
+adult_biomass <- ecopath_params %>%
+  group_by(Group.name) %>%
+  summarise(
+    biomass_observed = sum(Biomass..t.km.2., na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(adult_stanza = Group.name)
+
+species_params_tbl <- species_params(model_non_int) %>%
+  select(-any_of("biomass_observed")) %>%  # drop if present from a previous run
+  left_join(adult_map, by = "species") %>%
+  left_join(adult_biomass, by = "adult_stanza") %>%
+  mutate(
+    biomass_observed = coalesce(biomass_observed, 0),
+    biomass_cutoff   = w_mat
+  ) %>%
+  select(-adult_stanza)
+
+species_params(model_non_int) <- species_params_tbl
+
+# Calibration to single-species targets
+model_non_int <- model_non_int %>%
+  matchGrowth() %>%
+  steadySingleSpecies() %>%
+  matchBiomasses()
+
+
+```
+## 1.5 Match catch and consumption (landings‑only, not survey)
+
+We now match catches to the landings‑only observations and then align consumption with Ecopath reference values. (Survey and size‑at‑age inputs are not used in this non‑diffusion build.)
+
+```{r}
+## 1.5 Match catch and consumption (landings-only)
+# - use landings only
+# - standardise a single gear label
+
+landings_total <- cs_scaled_landings %>%
+  dplyr::mutate(
+    # harmonise casing to model names if needed
+    species = dplyr::recode(species, "Horse Mackerel" = "Horse mackerel")
+  ) %>%
+  dplyr::select(species, length, dl, count) %>%
+  dplyr::mutate(gear = "total")
+
+model_non_int <- model_non_int %>%
+  matchCatch(catch = landings_total, yield_lambda = 1) %>%
+  matchConsumption()
+
+```
+
+## 1.6 Add diet and prepare for interactions.
+In this step we add diet information to the model, using the updated Ecopath diet matrix (reformatted species × prey table). This enables diet‑based tuning and subsequent activation of  interactions with (matchDiet()).
+
+```{r}
+## 1.6 Add diet and prepare for interactions --------------------------------
+## Reduce the Ecopath diet to a species×species matrix and set kernels from
+## stomach-fit summaries (no joins; align by order like the original CS build).
+
+# Diet (Ecopath -> model species × species)
+ecopath_diet <- read.csv(
+  here("inst", "extdata", "Ecopath-Diet_updated_reformatted.csv"),
+  check.names = FALSE
+)
+
+dm <- reduceEcopathDiet(
+  species_params = species_params(model_non_int),
+  ecopath_diet   = ecopath_diet,
+  ecopath_params = ecopath_params
+)
+
+# Stomach-fit parameters (keep separate; align by scientific name)
+stf <- readRDS(here("inst", "extdata", "stomach_data_fit.rds"))
+
+sp  <- species_params(model_non_int)
+idx <- match(sp$SciName, stf$species)  # align order to species_params
+
+lambda <- 2
+sp$pred_kernel_type <- "power_law"
+sp$kernel_exp <- stf$alpha[idx] + 4/3 - lambda
+sp$kernel_l_l <- stf$ll[idx]
+sp$kernel_u_l <- stf$ul[idx]
+sp$kernel_l_r <- stf$lr[idx]
+sp$kernel_u_r <- stf$ur[idx]
+
+species_params(model_non_int) <- sp
+
+# Save a checkpoint
+#saveRDS(model_non_int, here("data","model_non_int.rds"))
+```
+
+## 1.7 Pre-tuning set up
+Sets up elements required before calling tuneEcopath
+
+```{r}
+# Directory for checkpoints
+chk_dir <- here("data")
+
+# Modify landings data for tuning (must have species, length, dl, catch, gear)
+catch_for_tune <- cs_scaled_landings %>%
+  mutate(
+    species = recode(species, "Horse Mackerel" = "Horse mackerel"),
+    gear    = "total"
+  ) %>%
+  transmute(
+    species,
+    length,
+    dl     = as.integer(dl),
+    catch  = as.numeric(count),
+    gear
+  )
+
+# Empty survey age-at-length stub so the gadget's Survey Age tab does not error [temporary solution due to using new mizerEcopath gadget]
+age_at_length_empty <- tibble::tibble(
+  species = character(),
+  survey  = character(),
+  length  = numeric(),
+  dl      = integer(),
+  age     = integer(),
+  count   = numeric()
+)
+```
+
+# 2 Manual tuning 
+
+Rounds of re-tuning with saved model object. 
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# Load the checkpoint saved at the end of 1.6 if required
+#model_non_int <- readRDS(file.path(chk_dir, "model_non_int.rds"))
+
+# Run the tuner - diffusion sliders will appear but have no effect on the model.  Reuse model_non_int_1 as the base object if partially tuned.
+model_non_int_1 <- tuneEcopath(
+    model_non_int,
+    controls = c("match","growth",
+                 "diffusion",
+                 "fishing",
+                 "reproduction",
+                 "other"),
+    catch         = catch_for_tune,
+    age_at_length = age_at_length_empty,
+    diet          = dm
+)
+
+# With the set up above, untick catch, press match, to save a state which can be returned to (pressing with catch ticked may return to the original catch configuration, which controls catchability, selectivity, and mortality).
+
+# Optional: save tuned checkpoint [will need to update the tuneEcopath command to use this instead to continue]
+# saveRDS(model_non_int_1, file.path(chk_dir, "model_tuned_1.rds"))
+
+```
+
+## 2.1 Further tuning on existing model object
+
+Use this to reopen tuneEcopath on the current model (model_non_int_1) without rebuilding. We explicitly set controls so the UI initialises cleanly (the diffusion tab is shown but inert). The app is fed the scaled landings (catch_for_tune), an empty age–length placeholder (age_at_length_empty), and the Ecopath-reduced diet matrix (dm).
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# model_non_int_1 <- readRDS(file.path(chk_dir, "model_tuned_1.rds"))
+
+#Area to rework partially tuned model
+model_non_int_1 <- tuneEcopath(
+    model_non_int_1,
+    controls = c("match","growth",
+                 "diffusion",
+                 "fishing",
+                 "reproduction",
+                 "other"),
+    catch         = catch_for_tune,
+    age_at_length = age_at_length_empty,
+    diet          = dm
+)
+
+# saveRDS(model_non_int_1, file.path(chk_dir, "model_tuned_1.rds"))
+```
+
+# Post-hoc helpers
+Sections below contain helpers which can be used to make changes to the feeding kernels and observed biomasses of species. May help if the size distribution curtails too early in the model vs observed.
+
+## Post hoc: Asymptotic size adjustment
+
+```{r}
+model_non_int_1@species_params$species
+#model_non_int_1@species_params$w_repro_max[6] <- 1400 
+#model_non_int_1@species_params$w_repro_max[3] <- 1250 
+#model_non_int_1@species_params$w_repro_max[11] <- 1000 
+model_non_int_1 <- setReproduction(model_non_int_1)
+```
+
+## Post-hoc: Kernel adjustment
+
+Use this section to edits to the predator–prey kernels.
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# Choose model
+p <- model_non_int_1 
+
+# Locate Hake row
+i <- match("Megrim", species_params(p)$species)
+
+# Backup current values so they can be reverted easily
+sp <- species_params(p)
+backup_hake <- sp[i, c("kernel_l_l","kernel_u_l","kernel_l_r","kernel_u_r","kernel_exp")]
+print(backup_hake)
+
+# Show current cut-offs on PPMR (mass ratio) scale for intuition (value is factor bigger of the predator than the prey).
+cat("Current cut-offs on PPMR scale:\n")
+cat("  lower (start-eating)  ~", exp(sp$kernel_l_l[i]), "\n")
+cat("  upper (stop-eating)   ~", exp(sp$kernel_l_r[i]), "\n")
+
+# --- Move Hake's lower cutoff to prey ≈ 1/10 of predator mass (PPMR = 10) ---
+# (Previously around 80x: exp(sp$kernel_l_l[i]) ~ 80)
+#sp$kernel_l_l[i] <- log(10)   # ≈ 2.302585; shifts rising sigmoid right to PPMR=10
+
+# --- Move Megrim's lower cutoff to prey ≈ 1/30 of predator mass  ---
+# (Previously around 50x)
+#sp$kernel_l_l[i] <- log(30)   
+
+# Write back and rebuild kernel lookups
+species_params(p) <- sp
+p <- setPredKernel(p)
+
+# Inspect new PPMR cut-offs
+cat("New cut-offs on PPMR scale:\n")
+cat("  lower ~", exp(species_params(p)$kernel_l_l[i]), "\n")
+cat("  upper ~", exp(species_params(p)$kernel_l_r[i]), "\n")
+
+# Finally put into the real model
+model_non_int_1 <- p
+```
+
+## Post-hoc: Biomass adjustment
+
+This helper allows quick manual scaling of the observed biomass target for selected species after tuning. It’s intended for fine adjustments — useful when Ecopath totals look implausible. The change affects reproduction equilibrium only and does not alter gear selectivity or fishing mortality. After scaling, the model re-equilibrates with matchBiomasses() and steadySingleSpecies() to maintain balance.
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# Post-hoc: multiply observed biomass targets and show a simple before/after
+# - factors: named numeric vector (e.g. c("Megrim" = 1.4, "Cod" = 1.2))
+#            OR a 2-column data.frame: species, factor
+# - reequilibrate: if TRUE, run matchBiomasses() and steadySingleSpecies()
+# Returns the updated model and prints a table for changed species.
+scale_observed_biomass <- function(p, factors, reequilibrate = TRUE, digits = 3) {
+  sp <- species_params(p)
+  sp_names <- as.character(sp$species)
+
+  # Normalise `factors` to a named numeric vector
+  if (is.data.frame(factors)) {
+    if (ncol(factors) < 2) stop("Provide a 2-column data.frame: species, factor")
+    fvec <- setNames(as.numeric(factors[[2]]), as.character(factors[[1]]))
+  } else if (is.numeric(factors) && !is.null(names(factors))) {
+    fvec <- factors
+  } else {
+    stop("Provide a named numeric vector (names = species) or a 2-col data.frame.")
+  }
+
+  # Keep only species that exist in the model
+  hit <- intersect(names(fvec), sp_names)
+  if (!length(hit)) stop("None of the provided species match species_params$species")
+
+  # Save original targets
+  original_target <- setNames(as.numeric(sp$biomass_observed), sp_names)
+
+  # Apply multiplicative scaling to targets
+  idx <- match(hit, sp_names)
+  sp$biomass_observed[idx] <- sp$biomass_observed[idx] * fvec[hit]
+  species_params(p) <- sp
+
+  # Re-equilibrate if requested (by default runs matchBiomasses and steady).
+  if (reequilibrate) {
+    p <- matchBiomasses(p)
+    p <- steadySingleSpecies(p, keep = "biomass")
+  }
+
+  # New targets + realised biomasses from the model
+  sp_after <- species_params(p)
+  new_target <- setNames(as.numeric(sp_after$biomass_observed), as.character(sp_after$species))
+
+  realised_vec <- tryCatch(
+    getBiomass(p),
+    error = function(e) setNames(rep(NA_real_, length(sp_names)), sp_names)
+  )
+
+  # Small, readable comparison for the species you changed
+  out <- data.frame(
+    species             = hit,
+    original_target     = as.numeric(original_target[hit]),
+    new_target          = as.numeric(new_target[hit]),
+    realised            = as.numeric(realised_vec[hit]),
+    realised_to_target  = as.numeric(realised_vec[hit]) /
+                          pmax(as.numeric(new_target[hit]), .Machine$double.eps),
+    check.names = FALSE
+  )
+
+  # Pretty print (optional rounding)
+  num_cols <- vapply(out, is.numeric, logical(1))
+  out[num_cols] <- lapply(out[num_cols], function(x) signif(x, digits))
+  rownames(out) <- NULL
+  print(out)
+  invisible(p)
+}
+
+    ## Example usage:
+# factors <- c("Megrim" = 1.4, "Cod" = 1.2)
+# model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors)
+
+####    Use biomass rescaler    ######################
+factors_fish_biomass <- c("Whiting" = 2) # Other uses run in console, check with helper below
+model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors_fish_biomass, reequilibrate = TRUE)
+######################################################
+### Compare biomass in model to original to check for any changes:
+
+compare_biomass_to_ecopath <- function(mod) {
+  # Accept either an object or a character name
+  if (is.character(mod)) mod <- get(mod, envir = parent.frame())
+
+  adult_map <- data.frame(
+    species      = names(species_to_groups),
+    adult_stanza = vapply(species_to_groups, function(x) x[[1]], character(1))
+  )
+
+  ecopath_adult <- ecopath_params %>%
+    group_by(Group.name) %>%
+    summarise(bio_ecopath = sum(Biomass..t.km.2., na.rm = TRUE), .groups = "drop")
+
+  out <- species_params(mod) %>% as.data.frame() %>%
+    select(species, bio_model = biomass_observed) %>%
+    left_join(adult_map, by = "species") %>%
+    left_join(ecopath_adult, by = c("adult_stanza" = "Group.name")) %>%
+    mutate(ratio = bio_model / pmax(bio_ecopath, .Machine$double.eps)) %>%
+    arrange(desc(abs(log10(pmax(ratio, .Machine$double.eps))))) %>%
+    select(species, bio_ecopath, bio_model, ratio)
+
+  print(out)
+  invisible(out)
+}
+
+# example:
+compare_biomass_to_ecopath(model_non_int_1)
+
+```
+
+# Comments
+
+use compareParams to see which model properties have changed between model iterations.
+
+In calibrating the Celtic Sea operational model I prioritise matching total yield and the catch-at-length composition, because these are the quantities most directly informed by the data (fishing mortality applied to estimated biomasses and the observed length structure of landings). Once those are in good order, I focus on interspecific interactions: predators must be able to meet their consumption needs without driving prey below sustainable levels at equilibrium. In practice that means ensuring that diets and size-based feeding preferences remain meet energy needs and are ecologically plauisible.
+
+Where strict agreement across all constraints is not possible, I allow controlled relaxation of either production or biomass assumptions. The aim is a transparent, steady-state calibration that balances fit to yield and length composition with trophic realism. Any departures from reference values will need to be recorded with a brief rationale so their implications for scenarios can be interpreted clearly later as required.
+
+Notes - Megrim; growth rate much higher than VBG, but production similar to estimate. Minor increases in biomass (up to 1.5 x) insufficient to make much difference (it remains hard to keep diet proportion > 1). At time of writing herring only has a 1.5 x increase in biomass vs base estimate. 
+
+# 3 Setting reproduction levels
+## F_MSY for each species
+Herring - 0.266 (Herring (Clupea harengus) in Division 7.a North of 52°30’N (Irish Sea), 2021)
+Cod - 0.29 (Cod Gadus morhua in Divisions 7.e–k, Celtic Sea & Western Channel, 2021)
+Megrim - 0.191 (Megrim Lepidorhombus whiffiagonis in Divisions 7.b–k, 8.a–b, and 8.d; ICES Advice 2021, Table 4 “Reference points”)
+Monkfish - 0.28 (White anglerfish, Lophius piscatorius; “White anglerfish in Subarea 7 and divisions 8.a–b & 8.d (Celtic Seas, Bay of Biscay)”, ICES Advice 2021, Table 4: Reference points)
+Haddock - 0.353 (Haddock (Melanogrammus aeglefinus) in divisions 7.b–k (southern Celtic Seas and English Channel), ICES Advice 2022)
+Whiting - 0.375 (Whiting (Merlangius merlangus) in divisions 7.b–c and 7.e–k (southern Celtic Seas and western English Channel), ICES Advice 2022)
+Hake - 0.24 (Hake Merluccius merluccius, Northern stock in subareas 4, 6, 7 and divisions 3.a, 8.a–b, 8.d; ICES Advice 2022)
+Blue whiting - 0.32 (Blue whiting Micromesistius poutassou in subareas 1–9, 12, and 14; ICES Advice 2022, Table 4 “Reference points”)
+Plaice - 0.196 (Plaice Pleuronectes platessa in Division 7.a (Irish Sea), ICES Advice 2021)
+Mackerel - 0.26 (Mackerel Scomber scombrus in subareas 1–8 & 14 and Division 9.a (Northeast Atlantic & adjacent waters), ICES Advice 2022)
+Sole - 0.251 (Sole Solea solea in divisions 7.f–g; Bristol Channel & Celtic Sea), ICES Advice 2023
+Horse mackerel - 0.074 (Western horse mackerel Trachurus trachurus in Subarea 8 and Divisions 2.a, 4.a, 5.b, 6.a, 7.a–c, and 7.e–k; ICES Advice 2022)
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# --- 1) Reproduction level tuning --------------------------------
+fmsy_vals <- c(
+  "Herring"        = 0.266,
+  "Cod"            = 0.29,
+  "Megrim"         = 0.191,
+  "Monkfish"       = 0.28,
+  "Haddock"        = 0.353,
+  "Whiting"        = 0.375,
+  "Hake"           = 0.24,
+  "Blue whiting"   = 0.32,
+  "Plaice"         = 0.196,  # proxy (Irish Sea)
+  "Mackerel"       = 0.26,
+  "Sole"           = 0.251,
+  "Horse mackerel" = 0.074
+)
+
+fmsy_tbl <- tibble(species = names(fmsy_vals), F_msy = unname(fmsy_vals))
+
+# --- Line up with the model and check for gaps ---------------------------
+sp <- species_params(model_non_int_1) |> as.data.frame()
+fmsy_aligned <- left_join(
+  sp[, c("species","w_mat")], fmsy_tbl, by = "species"
+)
+
+if (anyNA(fmsy_aligned$F_msy)) {
+  warning("Missing F_msy for: ",
+          paste(fmsy_aligned$species[is.na(fmsy_aligned$F_msy)], collapse = ", "))
+}
+
+# --- Ecopath F_total for adult stanza only -----------------------------------
+eco_F <- read.csv(here("inst","extdata","Ecopath-Fishing mortality rates.csv"))
+
+# Rename to 'Group.name' so it matches our adult_map join key
+names(eco_F)[names(eco_F) == "Fleet.group"] <- "Group.name"
+
+# Keep just the columns: identifier + numeric fleet F columns
+id_cols <- c("Group.name")
+num_cols <- setdiff(names(eco_F), id_cols)
+
+# Sum only numeric columns (different fleets) to a single F_total per row
+eco_F$F_total <- rowSums(eco_F[num_cols][vapply(eco_F[num_cols], is.numeric, FALSE)], na.rm = TRUE)
+
+eco_F <- eco_F |>
+  select(Group.name, F_total) |>
+  distinct()
+
+# Restrict to adult stanza by joining via the adult stanza name
+# (adult_map: species -> adult_stanza)
+eco_F_adult <- adult_map |>
+  left_join(eco_F, by = c("adult_stanza" = "Group.name")) |>
+  rename(F_ecopath_adult = F_total)
+
+# --- Pull catchability for the single 'total' gear -------------------------
+gp <- gear_params(model_non_int_1)
+q_tbl <- gp |>
+  filter(gear == "total") |>
+  select(species, q_total = catchability)
+
+fmsy_tbl <- tibble(species = names(fmsy_vals), F_msy = unname(fmsy_vals))
+
+# --- Assemble the target table -----------------------------------------------
+sp <- species_params(model_non_int_1) |> as.data.frame()
+
+targets <- sp |>
+  select(species) |>
+  left_join(eco_F_adult, by = "species") |>
+  left_join(q_tbl,      by = "species") |>
+  left_join(fmsy_tbl,   by = "species") |>
+  mutate(
+    # guard rails: avoid division by zero / NA
+    valid = !is.na(F_ecopath_adult) & F_ecopath_adult > 0 &
+            !is.na(q_total) & q_total > 0 & !is.na(F_msy) & F_msy > 0,
+    F_target_peak = dplyr::if_else(
+      valid, F_msy * (q_total / F_ecopath_adult), NA_real_
+    )
+  )
+
+targets_out <- targets |>
+  dplyr::select(species, F_msy, q_total, F_ecopath_adult, F_target_peak) |>
+  dplyr::arrange(species)
+
+print(targets_out)
+
+
+```
+
+Next plot the yield curves
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+---
+title: "Celtic Sea Operational Model"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.align = "center", fig.width = 7, fig.height = 4.5
+)
+# core packages
+suppressPackageStartupMessages({
+  library(mizer)
+  library(mizerExperimental)  
+  library(mizerEcopath)
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+  library(yaml)
+  library(remotes)
+  library(here)
+})
+
+# ---- Local package setup ----
+# We use a locally edited copy of mizerEcopath (0.1.0.9013) with master mizer (>= 2.5.3.9003).
+# The master branch does not export age_mat_vB(), so we provide a small local
+# compatibility wrapper (age_mat_vB_compat) and a matching newAllometricParams_compat().
+
+# To load the local mizerEcopath source directly, use:
+# devtools::load_all("C:/Documents/York academic/Projects/R projects/mizerEcopath")
+
+```
+
+# Introduction
+
+This document builds the **Celtic Sea Operational Model** in mizer using the **current ** (13.10.2025) main branch (no diffusion). It is set up for scenario projections and interactive exploration (e.g. with a Shiny front end) with an emphasis on reproducibility: all inputs, choices, and manual adjustments are recorded.
+
+**Model scope & key choices**
+
+Fishing data: landings-only gear constructed from updated landings-by-length (scaled to Ecopath totals). Survey gear is not included as separate gear choices are not available for tuning in this mizer release.
+
+Calibration: matchGrowth(), steadySingleSpecies(), matchBiomasses(), and matchCatch() available in this mizer release. Age-at-length data are **not** used in this release - growth is (more loosely) matched to growth curves.
+
+Diet: we import an updated and reformatted Ecopath diet matrix.
+
+# Modified helper functions (for newAllometricParams)
+
+Because the master (non-diffusion) build of mizer does not export the age_mat_vB() function required by newAllometricParams(), a small local compatibility function is added here. It reproduces the expected behaviour for estimating age at maturity from VB parameters and provides a matching newAllometricParams_compat() call that mirrors the original function. This ensures the model can be built on the diffusion-free mizer version without altering the wider workflow.
+
+```{r}
+# Local compatibility version mirroring mizer::age_mat_vB()
+age_mat_vB_compat <- function(object) {
+  ns <- try(getNamespace("mizer"), silent = TRUE)
+  if (!inherits(ns, "try-error") && exists("age_mat_vB", envir = ns, inherits = FALSE)) {
+    return(get("age_mat_vB", envir = ns, inherits = FALSE)(object))
+  }
+
+  if (inherits(object, "MizerParams")) {
+    sp <- object@species_params
+  } else {
+    if (!is.data.frame(object)) {
+      stop("The first argument must be either a MizerParams object or a species_params data frame.")
+    }
+    sp <- validSpeciesParams(object)
+  }
+
+  sp <- set_species_param_default(sp, "t0",   0)
+  sp <- set_species_param_default(sp, "b",    3)
+  sp <- set_species_param_default(sp, "k_vb", NA)
+  sp <- set_species_param_default(sp, "w_inf", sp$w_max)
+
+  a_mat <- -log(1 - (sp$w_mat / sp$w_inf)^(1 / sp$b)) / sp$k_vb + sp$t0
+  names(a_mat) <- sp$species
+  a_mat
+}
+
+
+newAllometricParams_compat <- function(species_params, no_w = 200) {
+  sp <- validGivenSpeciesParams(species_params)
+  sp <- set_species_param_default(sp, "n", 0.7)
+  sp$d <- sp$n - 1
+  sp <- set_species_param_default(sp, "alpha", 0.8)
+  sp$ks <- 0
+  sp$z0 <- 0
+
+  max_w <- max(sp$w_max)
+  p <- newMultispeciesParams(
+    sp, no_w = no_w, info_level = 0,
+    max_w = max_w, w_pp_cutoff = max_w * (1 + 1e-9),
+    resource_dynamics = "resource_constant"
+  )
+  sp <- p@species_params
+
+  interaction_matrix(p)[] <- 0
+  sp$interaction_resource <- 0
+  sp$h <- Inf
+  intake_max(p)[] <- Inf
+  species_params(p) <- sp
+
+  ext_encounter(p) <- t(outer(p@w, sp$n, "^"))
+  sp <- set_species_param_default(sp, "age_mat", age_mat_vB_compat(sp))
+  factor <- age_mat(p) / sp$age_mat
+  ext_encounter(p) <- sweep(ext_encounter(p), 1, factor, "*")
+  e0 <- getEGrowth(p)[, 1] / w(p)[1]^sp$n[1]
+
+  mu0 <- e0 * (1 + 0.2 - sp$n)
+  ext_mort(p) <- sweep(t(outer(p@w, sp$d, "^")), 1, mu0, "*")
+
+  p <- matchBiomasses(p)
+  p <- steadySingleSpecies(p, keep = "biomass")
+  p <- setBevertonHolt(p, reproduction_level = 0)
+  p
+}
+
+isAllometric_compat <- function(params, tol = 1e-5) {
+  sp <- params@species_params
+  sp <- set_species_param_default(sp, "d", sp$n - 1)
+  m <- getMort(params) - getFMort(params)
+  e <- getEncounter(params)
+  for (sp_name in sp$species) {
+    spc <- sp[sp_name, ]
+    mc <- m[sp_name, ] / params@w^spc$d
+    if (anyNA(mc) || any(is.nan(mc)) || any(mc < 0) || all(mc == 0)) stop("The model has invalid mortality rates.")
+    if (abs((max(mc) - min(mc)) / min(mc)) > tol) return(FALSE)
+    ec <- e[sp_name, ] / params@w^spc$n
+    if (anyNA(ec) || any(is.nan(ec)) || any(ec < 0) || all(ec == 0)) stop("The model has invalid encounter rates.")
+    if (abs((max(ec) - min(ec)) / min(ec)) > tol) return(FALSE)
+  }
+  TRUE
+}
+```
+
+# Load Data
+
+Load in the csv and rds files which contain species and empirical data. This includes data from DATRAS, STECF, and data from an existing Ecopath model (Lauria et al. 2016, including ongoing updates under Bentley et al.).
+
+```{r}
+# ---- Check for the required files
+req_files <- c(
+  here("inst","extdata","Ecopath-Basic estimates.csv"),
+  here("inst","extdata","Ecopath-Fishing mortality rates.csv"),
+  here("inst","extdata","cs_scaled_landings.csv"),
+  here("inst","extdata","life_histories.csv")
+)
+stopifnot(all(file.exists(req_files)))
+
+# ---- Ecopath basic estimates ----
+ecopath_params <- read.csv(here("inst","extdata","Ecopath-Basic estimates.csv"))
+
+# ---- Ecopath fishing mortality 
+yield <- read.csv(here("inst","extdata","Ecopath-Fishing mortality rates.csv"))
+colnames(yield)[2] <- "Group.name"
+
+# Sum all fleet columns
+fleet_cols <- setdiff(seq_len(ncol(yield)), 1:2)
+yield$Total <- rowSums(yield[, fleet_cols, drop = FALSE], na.rm = TRUE)
+
+# Join to basic estimates to compute total catch (t/km^2/yr) = Total * Biomass
+yield <- left_join(ecopath_params, yield, by = "Group.name") |>
+  mutate(TotalCatch..t.km..year. = Total * Biomass..t.km.2.) |>
+  select(Group.name, TotalCatch..t.km..year.)
+
+# ---- Landings (scaled; landings-only workflow) ----
+# Created in inst/Scaling Between Observed Landings and Ecopath.qmd
+cs_scaled_landings <- read.csv(here("inst","extdata","cs_scaled_landings.csv"))
+
+# Keep only total-gear rows; bin to 1 cm; aggregate
+cs_scaled_landings <- cs_scaled_landings[cs_scaled_landings$gear == "total", ] |>
+  mutate(length = floor(length)) |>
+  group_by(species, gear, length, Scientific_name) |>
+  summarise(
+    catch   = sum(scaled_catch,   na.rm = TRUE),
+    biomass = sum(scaled_biomass, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Columns expected downstream
+cs_scaled_landings$count <- cs_scaled_landings$catch
+cs_scaled_landings$dl    <- 1L # L ensures as integer
+cs_scaled_landings$gear  <- "landings"
+
+# Reorder 
+cs_scaled_landings <- cs_scaled_landings[, c(
+  "species","Scientific_name","length","dl","gear","catch","count","biomass"
+)]
+
+# Combined catch table used downstream
+catch <- cs_scaled_landings
+
+# ---- Life histories (FishBase-derived; prefer Unsexed/Mixed; no size-at-age merge) ----
+# (The parameter set choice is somewhat arbitrary at present)
+life_histories <- read.csv(here("inst","extdata","life_histories.csv"))
+
+life_histories_summary <- life_histories %>%
+  filter(Sex %in% c("Unsexed", "Mixed")) %>%
+  group_by(Species) %>%
+  slice(if (any(!is.na(l_mat))) which(!is.na(l_mat))[1] else 1) %>%
+  ungroup() %>%
+  mutate(Scientific_name = Species)
+```
+
+# 1 Building the untuned model
 ## 1.1 Species parameters
 
 We first assemble the species parameter table. We merge life-history information (length–weight, maturity length, maximum length) with Ecopath group names and ensure consistent species naming across all inputs.
@@ -561,7 +1394,7 @@ model_non_int_1@species_params$species
 #model_non_int_1@species_params$w_repro_max[6] <- 1400 
 #model_non_int_1@species_params$w_repro_max[3] <- 1250 
 #model_non_int_1@species_params$w_repro_max[11] <- 1000 
-model_non_int_1 <- setReproduction(model_non_int_1)
+#model_non_int_1 <- setReproduction(model_non_int_1)
 ```
 
 ## Post-hoc: Kernel adjustment
@@ -676,15 +1509,14 @@ scale_observed_biomass <- function(p, factors, reequilibrate = TRUE, digits = 3)
   invisible(p)
 }
 
-## Example usage:
+    ## Example usage:
 # factors <- c("Megrim" = 1.4, "Cod" = 1.2)
 # model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors)
 
 ####    Use biomass rescaler    ######################
 factors_fish_biomass <- c("Whiting" = 2) # Other uses run in console, check with helper below
-model_non_int <- scale_observed_biomass(model_non_int, factors_fish_biomass, reequilibrate = TRUE)
+model_non_int_1 <- scale_observed_biomass(model_non_int_1, factors_fish_biomass, reequilibrate = TRUE)
 ######################################################
-
 ### Compare biomass in model to original to check for any changes:
 
 compare_biomass_to_ecopath <- function(mod) {
@@ -713,7 +1545,7 @@ compare_biomass_to_ecopath <- function(mod) {
 }
 
 # example:
-compare_biomass_to_ecopath(model_non_int)
+compare_biomass_to_ecopath(model_non_int_1)
 
 ```
 
@@ -721,43 +1553,168 @@ compare_biomass_to_ecopath(model_non_int)
 
 use compareParams to see which model properties have changed between model iterations.
 
-# Redundant code - kept for reference only
+In calibrating the Celtic Sea operational model I prioritise matching total yield and the catch-at-length composition, because these are the quantities most directly informed by the data (fishing mortality applied to estimated biomasses and the observed length structure of landings). Once those are in good order, I focus on interspecific interactions: predators must be able to meet their consumption needs without driving prey below sustainable levels at equilibrium. In practice that means ensuring that diets and size-based feeding preferences remain meet energy needs and are ecologically plauisible.
 
-## x1 Add fishing mortality to allometric background
+Where strict agreement across all constraints is not possible, I allow controlled relaxation of either production or biomass assumptions. The aim is a transparent, steady-state calibration that balances fit to yield and length composition with trophic realism. Any departures from reference values will need to be recorded with a brief rationale so their implications for scenarios can be interpreted clearly later as required.
 
-# THIS SECTION IS NOW UNREQUIRED
+Notes - Megrim; growth rate much higher than VBG, but production similar to estimate. Minor increases in biomass (up to 1.5 x) insufficient to make much difference (it remains hard to keep diet proportion > 1). At time of writing herring only has a 1.5 x increase in biomass vs base estimate. 
 
-After matching catches and yield, we can extract F (fishing mortality) in the fitted model, and add it to the allometric external mortality. Tuning can continue from there.
+# 3 Setting reproduction levels
+## F_MSY for each species
+Herring - 0.266 (Herring (Clupea harengus) in Division 7.a North of 52°30’N (Irish Sea), 2021)
+Cod - 0.29 (Cod Gadus morhua in Divisions 7.e–k, Celtic Sea & Western Channel, 2021)
+Megrim - 0.191 (Megrim Lepidorhombus whiffiagonis in Divisions 7.b–k, 8.a–b, and 8.d; ICES Advice 2021, Table 4 “Reference points”)
+Monkfish - 0.28 (White anglerfish, Lophius piscatorius; “White anglerfish in Subarea 7 and divisions 8.a–b & 8.d (Celtic Seas, Bay of Biscay)”, ICES Advice 2021, Table 4: Reference points)
+Haddock - 0.353 (Haddock (Melanogrammus aeglefinus) in divisions 7.b–k (southern Celtic Seas and English Channel), ICES Advice 2022)
+Whiting - 0.375 (Whiting (Merlangius merlangus) in divisions 7.b–c and 7.e–k (southern Celtic Seas and western English Channel), ICES Advice 2022)
+Hake - 0.24 (Hake Merluccius merluccius, Northern stock in subareas 4, 6, 7 and divisions 3.a, 8.a–b, 8.d; ICES Advice 2022)
+Blue whiting - 0.32 (Blue whiting Micromesistius poutassou in subareas 1–9, 12, and 14; ICES Advice 2022, Table 4 “Reference points”)
+Plaice - 0.196 (Plaice Pleuronectes platessa in Division 7.a (Irish Sea), ICES Advice 2021)
+Mackerel - 0.26 (Mackerel Scomber scombrus in subareas 1–8 & 14 and Division 9.a (Northeast Atlantic & adjacent waters), ICES Advice 2022)
+Sole - 0.251 (Sole Solea solea in divisions 7.f–g; Bristol Channel & Celtic Sea), ICES Advice 2023
+Horse mackerel - 0.074 (Western horse mackerel Trachurus trachurus in Subarea 8 and Divisions 2.a, 4.a, 5.b, 6.a, 7.a–c, and 7.e–k; ICES Advice 2022)
 
 ```{r, warning=FALSE, message=FALSE, error=FALSE}
-# Add total fishing mortality (F) on top of existing external mortality
-# As such, first tune to create a F-tuned model, then extract the parameters from that. 
-add_F_to_extmort <- function(p, F) {
-  ext_mort(p) <- getExtMort(p) + F
-  p
-}
-
-## Tune to landings distribution and yield (start with model_non_int and switch to f_tuned_model if partially tuned):
-f_tuned_model <- tuneEcopath(
-    f_tuned_model,
-    controls = c("match","growth",
-                 "diffusion",
-                 "fishing",
-                 "reproduction",
-                 "other"),
-    catch         = catch_for_tune,
-    age_at_length = age_at_length_empty,
-    diet          = dm
+# --- Target table: place yield-curve peak at F_MSY * (q / F_ecopath_adult) ----
+# 1) F_MSY values (source notes kept in prose above)
+fmsy_vals <- c(
+  "Herring"        = 0.266,
+  "Cod"            = 0.29,
+  "Megrim"         = 0.191,
+  "Monkfish"       = 0.28,
+  "Haddock"        = 0.353,
+  "Whiting"        = 0.375,
+  "Hake"           = 0.24,
+  "Blue whiting"   = 0.32,
+  "Plaice"         = 0.196,  # proxy (Irish Sea)
+  "Mackerel"       = 0.26,
+  "Sole"           = 0.251,
+  "Horse mackerel" = 0.074
 )
+fmsy_tbl <- tibble(species = names(fmsy_vals), F_msy = unname(fmsy_vals))
 
-#saveRDS(f_tuned_model, here("data","f_tuned_model.rds"))
-# Load the checkpoint if required - will need to call add_F_to_extmort on this object.
-#f_tuned_model <- readRDS(file.path(chk_dir, "f_tuned_model.rds"))
+# 2) Read Ecopath F file and sum across fleets to get total F per Ecopath group
+ecoF <- read.csv(here("inst","extdata","Ecopath-Fishing mortality rates.csv"),
+                 check.names = FALSE)
 
-# 1. Estimate F from the tuned model
-F_mat <- getFMort(f_tuned_model)
+# Normalise column names (handle empty/NA headers)
+nm <- names(ecoF)
+empty <- which(is.na(nm) | nm == "")
+if (length(empty)) nm[empty] <- paste0("unnamed_", empty)
+names(ecoF) <- nm
 
-# 2. Add F onto the model’s external mortality
-f_tuned_model_MORT <- add_F_to_extmort(f_tuned_model, F_mat)
+# Identify the group-name column (first header containing "group"; else fall back to 2nd col)
+grp_col <- which(grepl("group", names(ecoF), ignore.case = TRUE))[1]
+if (is.na(grp_col)) grp_col <- 2
+names(ecoF)[grp_col] <- "Group.name"
+
+# Fleet columns = all except first and the group column
+fleet_cols <- setdiff(seq_len(ncol(ecoF)), c(1, grp_col))
+stopifnot(length(fleet_cols) > 0)
+
+# Coerce fleet columns to numeric and sum to F_total
+ecoF[fleet_cols] <- lapply(ecoF[fleet_cols], function(x) suppressWarnings(as.numeric(x)))
+ecoF_total <- data.frame(
+  Group.name = ecoF$Group.name,
+  F_ecopath_adult = rowSums(ecoF[, fleet_cols, drop = FALSE], na.rm = TRUE),
+  check.names = FALSE
+)
+# Drop NA group names and duplicates
+ecoF_total <- ecoF_total[!is.na(ecoF_total$Group.name), , drop = FALSE]
+ecoF_total <- ecoF_total[!duplicated(ecoF_total$Group.name), , drop = FALSE]
+
+# 3) Map Ecopath F_total to the adult stanza of each model species
+eco_F_adult <- adult_map |>
+  left_join(ecoF_total, by = c("adult_stanza" = "Group.name")) |>
+  select(species, F_ecopath_adult)
+
+# 4) Per-species catchability q 
+q_tbl <- gear_params(model_non_int_1) |>
+  group_by(species) |>
+  summarise(q = dplyr::first(na.omit(catchability)), .groups = "drop")
+
+# 5) Assemble target table
+# F_target_peak = F_MSY * (q / F_ecopath_adult)
+targets_out <- species_params(model_non_int_1) |>
+  as.data.frame() |>
+  select(species) |>
+  left_join(eco_F_adult, by = "species") |>
+  left_join(q_tbl,        by = "species") |>
+  left_join(fmsy_tbl,     by = "species") |>
+  mutate(
+    F_target_peak = ifelse(is.finite(F_msy * q / F_ecopath_adult),
+                           F_msy * q / F_ecopath_adult, NA_real_)
+  ) |>
+  select(species, F_msy, q, F_ecopath_adult, F_target_peak) |>
+  arrange(species)
+
+print(targets_out)
 
 ```
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+# ---- Yield-curve helpers (single-species) -----------------------------------
+
+# repro_lvl_original <- getReproductionLevel(model_non_int_1)
+getReproductionLevel(model_non_int_1)
+
+# Return a scalar F_target_peak for one species (or NA if not found)
+get_Ft_one <- function(species_name, targets_tbl = targets_out) {
+  stopifnot(is.character(species_name), length(species_name) == 1)
+  i <- match(species_name, targets_tbl$species)
+  if (is.na(i)) return(NA_real_)
+  as.numeric(targets_tbl$F_target_peak[i])
+}
+
+# Plot yield vs F for one species, optionally add a vertical line at target F
+plot_yield_with_target <- function(p, species_name,
+                                   expand = 1.5, step = 0.02, tol = 1e-4,
+                                   targets_tbl = targets_out) {
+  stopifnot(is.character(species_name), length(species_name) == 1)
+  Ft <- get_Ft_one(species_name, targets_tbl)
+  Fmax <- if (is.finite(Ft)) max(0.9, expand * Ft) else 1.0
+  g <- plotYieldVsF(
+    p, species = species_name,
+    F_range = seq(0, Fmax, by = step),
+    tol = tol
+  )
+  if (is.finite(Ft)) g <- g + ggplot2::geom_vline(xintercept = Ft, linetype = 2)
+  g
+}
+
+# Edit reproduction level for a single species and return updated model
+set_reproduction_level_one <- function(p, species_name, level) {
+  stopifnot(is.character(species_name), length(species_name) == 1)
+  rl <- getReproductionLevel(p)
+  if (!(species_name %in% names(rl))) {
+    stop("Species not found in reproduction_level vector: ", species_name)
+  }
+  rl[species_name] <- level
+  setBevertonHolt(p, reproduction_level = rl)
+}
+
+# ---- Example usage ----------------------------------------------------------
+# Species list
+model_non_int_1@species_params$species
+
+# Choose a species
+sp_name <- "Plaice"
+
+# Inspect current target_F
+Ft <- get_Ft_one(sp_name)   
+print(Ft)
+
+# Plot current yield curve with target marker
+plot_yield_with_target(model_non_int_1, sp_name)
+
+# Tweak reproduction level and re-plot
+model_non_int_1 <- set_reproduction_level_one(model_non_int_1, sp_name, 0.5)
+plot_yield_with_target(model_non_int_1, sp_name)
+
+# Stash reproduction levels if not already saved into model:
+repro_lvl_tuned <- getReproductionLevel(model_non_int_1)
+
+```
+
+# Resilience comments
+With landings-only selectivity and current background mortality, Megrim’s yield peak stays around 0.32–0.35 1/yr, above the target 0.158 1/yr. Reproduction-level changes beyond ~1e-2 have diminishing impact.
